@@ -3,9 +3,9 @@ import datetime, os
 import tensorflow as tf
 import tqdm
 
-filters = 64
+filters = 128
 color_size = 8
-layers = 4
+layers = 1
 
 batch_size = 1
 steps_per_epoch = 2000
@@ -31,16 +31,13 @@ def categorical_sample(logits):
 class Generator(tf.keras.Model):
     def __init__(self):
         super().__init__()
-        self.dense_in = [
-            [
-                tf.keras.layers.Dense(filters, activation=tf.nn.relu) 
-                for _ in range(3)
-            ]
-            for _ in range(layers)
-        ]
-        self.dense_final = [
-            tf.keras.layers.Dense(color_size) for _ in range(3)
-        ]
+        self.dense_in = [tf.keras.layers.Dense(filters) for _ in range(layers)]
+        self.dense_final = tf.keras.layers.Dense(color_size)
+        self.positional_encoding = tf.Variable(
+            initial_value=tf.zeros([256 * 256 * 3, filters]),
+            trainable=True,
+        )
+
 
     @tf.function
     def call(self, example):
@@ -48,35 +45,31 @@ class Generator(tf.keras.Model):
 
         shape = tf.shape(example)
 
-        length = tf.reduce_prod(shape[-3:-1])
+        length = tf.reduce_prod(shape[-3:])
 
         x = tf.reshape(
             example, 
-            tf.concat([shape[:-3], [length, 3, 1]], 0)
+            tf.concat([shape[:-3], [length, 1]], 0)
         )
-        # x[batch, height * width, channel, 1]
+        # x[batch, height * width * channel, 1]
 
-        factor = 1 / tf.range(1, length + 1, dtype=tf.float32)[:, None]
+        #factor = 1 / tf.range(1, length + 1, dtype=tf.float32)[:, None]
+
+        x = x * 2 - 1
         
         for i in range(layers):
-            x = tf.stack(
-                [self.dense_in[i][c](x[..., c, :]) for c in range(3)], -2
-            )
+            x = self.dense_in[i](x)
+
+            if i == 0:
+                x += self.positional_encoding
+
+            x = tf.nn.relu(x)
             
-            x = tf.reshape(
-                x, tf.concat([shape[:-3], [length * 3, filters]], 0)
-            )
-
             #x = tf.math.cumsum(x, -2) * factor # prefix mean
-            x = tf.math.cumsum(x, -2) / 256 / 256 / 3
+            #x = tf.concat([x, tf.math.cumsum(x, -2) / 256 / 256 / 3], -1)
+            x = tf.math.l2_normalize(tf.math.cumsum(x, -2), -1)
 
-            x = tf.reshape(x, 
-                tf.concat([shape[:-3], [length, 3, filters]], 0)
-            )
-
-        x = tf.stack(
-            [self.dense_final[c](x[..., c, :]) for c in range(3)], -2
-        )
+        x = self.dense_final(x)
 
         x = tf.reshape(
             x, tf.concat([shape, [color_size]], 0)
@@ -85,42 +78,44 @@ class Generator(tf.keras.Model):
         return x
 
     @tf.function
-    def sample(self, height, width):
-        length = height * width
-        factor = 1 / tf.range(1, length + 1, dtype=tf.float32)[:, None]
+    def sample(self):
+        length = 256 * 256 * 3
 
         @tf.function
-        def value(a, f):
-            pixel, sums = a
-            x = pixel[..., -1:, :]
+        def value(a, p):
+            x, sums = a
             sums = sums[:]
-            pixel = []
-            for c in range(3):
-                x = x * 2 - 1
-                for i in range(layers):
-                    x = self.dense_in[i][c](x)
-                    sums[i] += x
-                    #x = sums[i] * f
-                    x = sums[i] / 256 / 256 / 3
-                
-                x = self.dense_final[c](x)
 
-                x = (
-                    tf.cast(categorical_sample(x), tf.float32)[..., None] / 
-                    color_size
-                )
-                pixel += [x]
+            x = x * 2 - 1
 
-            pixel = tf.concat(pixel, -2)
+            for i in range(layers):
+                x = self.dense_in[i](x)
 
-            return (pixel, sums)
+                if i == 0:
+                    x += p
+
+                x = tf.nn.relu(x)
+
+                sums[i] += x
+                #x = sums[i] * f
+                x = tf.math.l2_normalize(sums[i], -1)
+                #x = tf.concat([x, sums[i] / 256 / 256 / 3], -1)
+            
+            x = self.dense_final(x)
+
+            x = (
+                tf.cast(categorical_sample(x), tf.float32)[..., None] / 
+                color_size
+            )
+
+            return (x, sums)
 
         fake = tf.scan(
-            value, factor, 
-            (tf.zeros([3, 1]), [tf.zeros([1, filters])] * layers)
+            value, self.positional_encoding, 
+            (tf.zeros([1, 1]), [tf.zeros([1, filters])] * layers)
         )[0]
 
-        x = tf.reshape(fake, [height, width, 3])
+        x = tf.reshape(fake, [256, 256, 3])
 
         return x
 
@@ -151,9 +146,9 @@ classes = [
 datasets = []
 
 example = prepare_example(load_file(
-    "../Datasets/safebooru_r63_256/train/male/" +
-    "00fdb833c64d7824edaa555277e494331b3882891f9422c6bca07611a5193b5f.png"
-), False)
+    "../Datasets/safebooru_r63_256/test/female/" +
+    "00af2f4796bcf58f445ab78e4f8a42f4931c28eec024de0e79872fa019575c5f.png"
+))
 
 for i, folder in enumerate(classes):
     dataset = tf.data.Dataset.list_files(folder)
@@ -170,7 +165,7 @@ summary_writer = tf.summary.create_file_writer(log_folder)
 model = Generator()
 
 def log_sample(epochs, logs):
-    fake = model.sample(64, 256)[None]
+    fake = model.sample()[None]
 
     prediction = model(example[0][None])
     prediction = tf.cast(
@@ -190,7 +185,7 @@ prediction = model(example[0][None])
 #loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
 #    example[None], prediction
 #)
-#fake = model.sample(256, 256)
+fake = model.sample()
 
 
 model.compile(
