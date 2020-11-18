@@ -4,11 +4,9 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 import tqdm
 
-filters = 16
-kernel_size = 31
 size = 256
 
-batch_size = 1
+batch_size = 16
 
 gpu = tf.config.experimental.list_physical_devices('GPU')[0]
 tf.config.experimental.set_memory_growth(gpu, True)
@@ -28,9 +26,8 @@ classes = [
 datasets = []
 
 example = load_file(
-    "../Datasets/safebooru_r63_256/train/male/" +
-    "00fdb833c64d7824edaa555277e494331b3882891f9422c6bca07611a5193b5f.png", 
-    False
+    "../Datasets/safebooru_r63_256/test/female/" +
+    "00af2f4796bcf58f445ab78e4f8a42f4931c28eec024de0e79872fa019575c5f.png"
 )
 
 for folder in classes:
@@ -86,63 +83,100 @@ def depth_to_space(event_shape, block_size):
     ))
    
 class Dense(tf.keras.layers.Layer):
-    def __init__(self, outputs):
+    def __init__(self, outer, inner):
         super().__init__()
+        self.outer = outer
+        self.inner = inner
 
         self.matrix = self.add_weight(
-            shape=(outputs, outputs), 
-            initializer=lu_initializer
+            shape=(inner, inner), 
+            initializer=tf.keras.initializers.RandomNormal()
         )
         self.bias = self.add_weight(
-            shape=(outputs,), initializer=tf.keras.initializers.Zeros()
+            shape=(outer, inner), initializer=tf.keras.initializers.Zeros()
         )
 
-    def bijector(self):
-        return tfp.bijectors.Chain([
-            tfp.bijectors.Affine(self.bias),
-            tfp.bijectors.MatvecLU(
-                self.matrix, [1, 2, 0]
-            )
-        ])
+    def call(self, x):
+        x = tfp.bijectors.Affine(self.bias)(x)
+        
+        #x = tfp.bijectors.MatvecLU(
+        #    self.matrix, list(reversed(range(self.outputs)))
+        #)(x)
 
-class Block(tf.keras.layers.Layer):
-    def __init__(self):
-        super().__init__()
+        x = tfp.bijectors.Inline(
+            lambda x: tf.einsum(
+                "ab,...ob->...oa", tf.linalg.expm(self.matrix), x
+            ),
+            lambda x: tf.einsum(
+                "ab,...ob->...oa", tf.linalg.expm(-self.matrix), x
+            ),
+            lambda x: -tf.linalg.trace(self.matrix),
+            lambda x: tf.linalg.trace(self.matrix),
+            is_constant_jacobian=True, forward_min_event_ndims=1
+        )(x)
 
-        self.convolution = tf.keras.layers.Conv2D(
-            filters, kernel_size, 1, 'same'
-        )
-        self.dense = tf.keras.layers.Dense(1)
-
-        self.bijective_dense = Dense(3)
-
-        self.batch_norm = tfp.bijectors.BatchNormalization()
-
-    def nonlinearity(self, input):
-        shift = self.dense(tf.nn.relu(self.convolution(input)))
-        return tfp.bijectors.Affine(shift)
-
-    def bijector(self):
-        return tfp.bijectors.Chain([
-            lift(lambda x: self.nonlinearity(x), 1, 3),
-            self.bijective_dense.bijector(),
-            self.batch_norm,
-            #tfp.bijectors.Permute([1, 2, 0]),
-        ])
-
+        return x
+        
 
 class Generator(tf.keras.Model):
     def __init__(self):
         super().__init__()
         
-        self.blocks = [Block() for _ in range(8)]
+        self.block1 = Dense(8 * 8 * 4 * 4 * 3, 8 * 8)
+        self.block2 = Dense(8 * 8 * 4 * 4 * 3, 8 * 8)
+        self.block3 = Dense(8 * 8 * 8 * 8, 4 * 4 * 3)
 
-    def bijector(self):
-        return tfp.bijectors.Chain([
-            #space_to_depth([size, size, 3], [4, 4]),
-        ] + [b.bijector() for b in self.blocks] + [
-            #depth_to_space([size//4, size//4, 3*4*4], [4, 4]),
-        ])
+    def biject(self, x):
+        # x[batch, width, height, channels]
+        # organize in blocks
+        x = tfp.bijectors.Reshape([8, 8, 4, 8, 8, 4, 3], [size, size, 3])(x)
+        x = tfp.bijectors.Transpose([0, 3, 1, 4, 2, 5, 6])(x)
+        # x[batch, y1, x1, y2, x2, y3, x3, channels]
+
+        x = tfp.bijectors.Reshape(
+            [8 * 8, 8 * 8, 4 * 4 * 3], [8, 8, 8, 8, 4, 4, 3]
+        )(x)
+
+        # outer most
+        x = tfp.bijectors.Transpose([1, 2, 0])(x)
+        x = tfp.bijectors.Reshape(
+            [8 * 8 * 4 * 4 * 3, 8 * 8], [8 * 8, 4 * 4 * 3, 8 * 8]
+        )(x)
+
+        x = self.block1(x)
+
+        # middle
+        x = tfp.bijectors.Reshape(
+            [8 * 8, 4 * 4 * 3, 8 * 8], [8 * 8 * 4 * 4 * 3, 8 * 8]
+        )(x)
+        x = tfp.bijectors.Transpose([1, 2, 0])(x)
+        x = tfp.bijectors.Reshape(
+            [4 * 4 * 3 * 8 * 8, 8 * 8], [4 * 4 * 3, 8 * 8, 8 * 8]
+        )(x)
+
+        x = self.block2(x)
+
+        # inner most
+        x = tfp.bijectors.Reshape(
+            [4 * 4 * 3, 8 * 8, 8 * 8], [4 * 4 * 3 * 8 * 8, 8 * 8]
+        )(x)
+        x = tfp.bijectors.Transpose([1, 2, 0])(x)
+        x = tfp.bijectors.Reshape(
+            [8 * 8 * 8 * 8, 4 * 4 * 3], [8 * 8, 8 * 8, 4 * 4 * 3]
+        )(x)
+
+        x = self.block3(x)
+
+        # re-block
+        x = tfp.bijectors.Reshape(
+            [8, 8, 8, 8, 4, 4, 3], [8 * 8 * 8 * 8, 4 * 4 * 3]
+        )(x)
+        x = tfp.bijectors.Transpose([0, 2, 4, 1, 3, 5, 6])(x)
+        x = tfp.bijectors.Reshape(
+            [8 * 8 * 4, 8 * 8 * 4, 3], [8, 8, 4, 8, 8, 4, 3]
+        )(x)
+        
+        return x
 
     def call(self, example):
         distribution = tfp.distributions.Independent(
@@ -150,9 +184,7 @@ class Generator(tf.keras.Model):
                 tf.zeros_like(example), 1.0
             ), 3
         )
-        return tfp.distributions.TransformedDistribution(
-            distribution, self.bijector()
-        ).log_prob(example) / (size * size)
+        return self.biject(distribution).log_prob(example) / (size * size)
 
     def sample(self, size):
         distribution = tfp.distributions.Independent(
@@ -160,9 +192,7 @@ class Generator(tf.keras.Model):
                 tf.zeros(size), 1.0
             ), 3
         )
-        return tfp.distributions.TransformedDistribution(
-            distribution, self.bijector()
-        ).sample()
+        return self.biject(distribution).sample()
 
 model = Generator()
 
@@ -171,10 +201,15 @@ def log_sample(epochs, logs):
         fake = model.sample([4, size, size, 3]) * 0.5 + 0.5
         tf.summary.image('fake', fake, epochs, 4)
         del fake
+        code = model.biject(tfp.bijectors.Identity()).inverse(example[0])
+        tf.summary.image('code', code[None] * 0.5 + 0.5, epochs)
+        del code
 
 
 name = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M")
 summary_writer = tf.summary.create_file_writer(os.path.join("logs", name))
+
+log_sample(0, None)
 
 model.compile(
     tf.keras.optimizers.Adam(),#.SGD(1e-3), 
