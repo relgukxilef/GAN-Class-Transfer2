@@ -4,100 +4,110 @@ import tensorflow as tf
 import tqdm
 
 size = 256
-filters = 1024
+filters = 128
 
-batch_size = 1
+batch_size = 4
 
 gpu = tf.config.experimental.list_physical_devices('GPU')[0]
 tf.config.experimental.set_memory_growth(gpu, True)
 
-class Dense2DBias(tf.keras.layers.Layer):
-    def __init__(self, units, size):
-        super().__init__()
-
-        self.dense = tf.keras.layers.Dense(units, use_bias=False)
-        self.size = size
-        self.bias = self.add_weight(
-            "bias",
-            shape=[size, size, units]
-        )
-
-    def build(self, input_shape):
-        self.dense.build(input_shape)
-
-    def call(self, input):
-        return self.dense(input) + self.bias
-
-class Discriminator(tf.keras.Model):
+class PairwiseSum(tf.keras.layers.Layer):
     def __init__(self):
         super().__init__()
-        
-        self.dense0 = tf.keras.layers.Dense(filters, use_bias=False)
-        self.dense1 = tf.keras.layers.Dense(filters, activation='relu')
-        self.dense2 = tf.keras.layers.Dense(1, kernel_initializer='zeros')
-        self.encoding = self.add_weight(
-            "encoding",
-            shape=[size, size, filters]
-        )
 
-    def call(self, image):
-        x = tf.nn.relu(self.encoding + self.dense0(image))
-        x = tf.keras.layers.GlobalAveragePooling2D()(x)
-        x = self.dense1(x)
-        return self.dense2(x)
-            
+    def call(self, input):
+        a, b = tf.split(input, 2, 0)
+        return a + b
 
-optimizer = tf.keras.optimizers.Adam()
+class Residual(tf.keras.layers.Layer):
+    def __init__(self, module):
+        super().__init__()
+
+        self.module = module
+
+    def build(self, input_shape):
+        self.module.build(input_shape)
+
+    def call(self, input):
+        return input + self.module(input)
+
+#optimizer = tf.keras.optimizers.Adam()
 #optimizer = tf.keras.optimizers.RMSprop(1e-5)
+optimizer = tf.keras.optimizers.SGD(1e-4)
 
-encoder = tf.keras.Sequential([
-    Dense2DBias(filters, size),
-    tf.keras.layers.ReLU(),
-    Dense2DBias(filters, size),
-    tf.keras.layers.ReLU(),
-    tf.keras.layers.GlobalAveragePooling2D(),
+def block():
+    return tf.keras.Sequential([
+        tf.keras.layers.Conv2D(filters, 3, 1, 'same', activation='relu'),
+        tf.keras.layers.Conv2D(filters, 3, 1, 'same')
+    ])
+
+generator = tf.keras.Sequential([
     tf.keras.layers.Dense(filters, activation='relu'),
-    tf.keras.layers.Dense(filters)
+    tf.keras.layers.Dense(filters * 8 * 8),
+    tf.keras.layers.Reshape((8, 8, -1)),
+    # 8x8
+    tf.keras.layers.UpSampling2D(interpolation='bilinear'),
+    Residual(block()),
+    tf.keras.layers.UpSampling2D(interpolation='bilinear'),
+    Residual(block()),
+    tf.keras.layers.UpSampling2D(interpolation='bilinear'),
+    Residual(block()),
+    tf.keras.layers.UpSampling2D(interpolation='bilinear'),
+    Residual(block()),
+    tf.keras.layers.UpSampling2D(interpolation='bilinear'),
+    Residual(block()),
+    # 256x256
+    tf.keras.layers.Dense(filters, activation='relu'),
+    tf.keras.layers.Dense(3),
 ])
-decoder = tf.keras.Sequential([
-    tf.keras.layers.Reshape((1, 1, -1)),
-    Dense2DBias(filters, size),
-    tf.keras.layers.ReLU(),
-    Dense2DBias(filters, size),
-    tf.keras.layers.ReLU(),
-    tf.keras.layers.Dense(3)
+discriminator = tf.keras.Sequential([
+    tf.keras.layers.Dense(filters, activation='relu'),
+    tf.keras.layers.Dense(filters),
+    # 256x256
+    Residual(block()),
+    tf.keras.layers.AveragePooling2D(2, 2),
+    Residual(block()),
+    tf.keras.layers.AveragePooling2D(2, 2),
+    Residual(block()),
+    tf.keras.layers.AveragePooling2D(2, 2),
+    Residual(block()),
+    tf.keras.layers.AveragePooling2D(2, 2),
+    Residual(block()),
+    tf.keras.layers.AveragePooling2D(2, 2),
+    # 8x8
+    tf.keras.layers.Flatten(),
+    tf.keras.layers.Dense(filters, activation='relu'),
+    #PairwiseSum(),
+    tf.keras.layers.Dense(filters, activation='relu'),
+    tf.keras.layers.Dense(1),
 ])
-generator = tf.keras.Sequential([encoder, decoder])
-discriminator = Discriminator()
 
 @tf.function
 def train_step(source_images, target_images, step):
     target_images = tf.image.random_flip_left_right(target_images)
 
     with tf.GradientTape(persistent=True) as tape:
-        #generated_images = decoder(tf.random.normal([batch_size, filters]))
-        generated_images = generator(target_images)
+        generated_images = generator(tf.random.normal([batch_size, filters]))
 
-        generator_loss = tf.keras.losses.MeanSquaredError()(
-            generated_images, target_images
-        )
-
-        #real_output = discriminator(target_images)
-        #fake_output = discriminator(generated_images)
+        real_output = discriminator(target_images)
+        fake_output = discriminator(generated_images)
 
         #generator_loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)(
         #    tf.ones_like(fake_output), fake_output
         #)
         #generator_loss = tf.keras.losses.MeanSquaredError()(0, fake_output)
+        generator_loss = tf.reduce_mean(
+            -0.5 * fake_output + tf.math.softplus(fake_output)
+        )
 
-        #discriminator_loss = 0.5 * sum([
-        #    tf.keras.losses.BinaryCrossentropy(from_logits=True)(
-        #        tf.ones_like(real_output), real_output
-        #    ),
-        #    tf.keras.losses.BinaryCrossentropy(from_logits=True)(
-        #        tf.zeros_like(fake_output), fake_output
-        #    )
-        #])
+        discriminator_loss = 0.5 * sum([
+            tf.keras.losses.BinaryCrossentropy(from_logits=True)(
+                tf.ones_like(real_output), real_output
+            ),
+            tf.keras.losses.BinaryCrossentropy(from_logits=True)(
+                tf.zeros_like(fake_output), fake_output
+            )
+        ])
         #discriminator_loss = 0.5 * (
         #    tf.keras.losses.MeanSquaredError()(1, real_output) +
         #    tf.keras.losses.MeanSquaredError()(-1, fake_output)
@@ -107,10 +117,10 @@ def train_step(source_images, target_images, step):
         tape.gradient(generator_loss, generator.trainable_variables), 
         generator.trainable_variables
     ))
-    #optimizer.apply_gradients(zip(
-    #    tape.gradient(discriminator_loss, discriminator.trainable_variables), 
-    #    discriminator.trainable_variables
-    #))
+    optimizer.apply_gradients(zip(
+        tape.gradient(discriminator_loss, discriminator.trainable_variables), 
+        discriminator.trainable_variables
+    ))
 
 def load_file(file, crop=True):
     image = tf.image.decode_jpeg(tf.io.read_file(file))[:, :, :3]
@@ -155,7 +165,7 @@ progress = tqdm.tqdm(tf.data.Dataset.zip(tuple(datasets)))
 for step, (image_x, image_y) in enumerate(progress):
     train_step(image_x, image_y, tf.constant(step, tf.int64))
     
-    if step % 500 == 0:
+    if step % 100 == 0:
         with summary_writer.as_default():
             #tf.summary.scalar('generator_loss', generator_loss, step)
             #tf.summary.scalar('discriminator_loss', discriminator_loss, step)
@@ -163,14 +173,9 @@ for step, (image_x, image_y) in enumerate(progress):
                 'fakes', 
                 tf.clip_by_value(
                     generator(
-                        example[None]
+                        tf.random.normal([4, filters])
                     ) * 0.5 + 0.5, 
                     0, 1
                 ), 
                 step, 4
             )
-            for i, model in enumerate([encoder.layers[0].bias]):
-                encoding = get_encoding_summary(model)
-                tf.summary.image(
-                    'encoding/' + str(i), encoding, step, 8
-                )
