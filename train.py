@@ -1,130 +1,165 @@
 
 import datetime, os
 import tensorflow as tf
+#import tensorflow_probability as tfp
 import tqdm
 
 size = 256
-filters = 1024
+code_size = 1024
+pixel_size = 32
 
-batch_size = 1
+batch_size = 8
 
 gpu = tf.config.experimental.list_physical_devices('GPU')[0]
 tf.config.experimental.set_memory_growth(gpu, True)
 
-class Dense2DBias(tf.keras.layers.Layer):
-    def __init__(self, units, size):
+#optimizer = tf.keras.optimizers.Adam(epsilon=0.01)
+# higher learning rate causes dominance of KL loss
+optimizer = tf.keras.optimizers.RMSprop(1e-4) 
+
+class Residual(tf.keras.layers.Layer):
+    def __init__(self, module, scale):
         super().__init__()
 
-        self.dense = tf.keras.layers.Dense(units, use_bias=False)
-        self.size = size
-        self.bias = self.add_weight(
-            "bias",
-            shape=[size, size, units]
-        )
+        self.module = module
+        self.scale = scale
 
     def build(self, input_shape):
-        self.dense.build(input_shape)
+        self.module.build(input_shape)
+        self.scale.build(input_shape)
 
     def call(self, input):
-        return self.dense(input) + self.bias
+        return self.scale(input) + self.module(input)
 
-class Discriminator(tf.keras.Model):
-    def __init__(self):
+class UpBlock(tf.keras.layers.Layer):
+    def __init__(self, filters):
         super().__init__()
-        
-        self.dense0 = tf.keras.layers.Dense(filters, use_bias=False)
-        self.dense1 = tf.keras.layers.Dense(filters, activation='relu')
-        self.dense2 = tf.keras.layers.Dense(1, kernel_initializer='zeros')
-        self.encoding = self.add_weight(
-            "encoding",
-            shape=[size, size, filters]
-        )
 
-    def call(self, image):
-        x = tf.nn.relu(self.encoding + self.dense0(image))
-        x = tf.keras.layers.GlobalAveragePooling2D()(x)
-        x = self.dense1(x)
-        return self.dense2(x)
-            
+        self.filters = filters
 
-optimizer = tf.keras.optimizers.Adam()
-#optimizer = tf.keras.optimizers.RMSprop(1e-5)
+    def build(self, input_shape):
+        self.module = tf.keras.Sequential([
+            tf.keras.layers.Conv2DTranspose(
+                self.filters, 4, 2, 'same', activation='relu'
+            ),
+            tf.keras.layers.Conv2D(input_shape[-1], 3, 1, 'same')
+        ])
+        self.module.build(input_shape)
+
+    def call(self, input):
+        return self.module(input)
+
+class DownBlock(tf.keras.layers.Layer):
+    def __init__(self, filters):
+        super().__init__()
+
+        self.filters = filters
+
+    def build(self, input_shape):
+        self.module = tf.keras.Sequential([
+            tf.keras.layers.Conv2D(
+                self.filters, 3, 1, 'same', activation='relu'
+            ),
+            tf.keras.layers.Conv2D(input_shape[-1], 3, 2, 'same')
+        ])
+        self.module.build(input_shape)
+
+    def call(self, input):
+        return self.module(input)
 
 encoder = tf.keras.Sequential([
-    Dense2DBias(filters, size),
-    tf.keras.layers.ReLU(),
-    Dense2DBias(filters, size),
-    tf.keras.layers.ReLU(),
-    tf.keras.layers.GlobalAveragePooling2D(),
-    tf.keras.layers.Dense(filters, activation='relu'),
-    tf.keras.layers.Dense(filters)
+    tf.keras.layers.Dense(pixel_size, activation='relu'),
+    tf.keras.layers.Dense(pixel_size),
+    # 256x256
+    Residual(
+        DownBlock(pixel_size), 
+        tf.keras.layers.AveragePooling2D(2, 2)
+    ),
+    Residual(
+        DownBlock(pixel_size * 4),
+        tf.keras.layers.AveragePooling2D(2, 2)
+    ),
+    Residual(
+        DownBlock(pixel_size * 4 * 4),
+        tf.keras.layers.AveragePooling2D(2, 2)
+    ),
+    Residual(
+        DownBlock(pixel_size * 4 * 4 * 4),
+        tf.keras.layers.AveragePooling2D(2, 2)
+    ),
+    Residual(
+        DownBlock(pixel_size * 4 * 4 * 4 * 4),
+        tf.keras.layers.AveragePooling2D(2, 2)
+    ),
+    # 8x8
+    tf.keras.layers.Flatten(),
+    tf.keras.layers.Dense(pixel_size * 4 * 4 * 4 * 4 * 4, activation='relu'),
+    tf.keras.layers.Dense(code_size * 2),
 ])
 decoder = tf.keras.Sequential([
-    tf.keras.layers.Reshape((1, 1, -1)),
-    Dense2DBias(filters, size),
-    tf.keras.layers.ReLU(),
-    Dense2DBias(filters, size),
-    tf.keras.layers.ReLU(),
-    tf.keras.layers.Dense(3)
+    tf.keras.layers.Dense(pixel_size * 4 * 4 * 4 * 4 * 4, activation='relu'),
+    tf.keras.layers.Dense(pixel_size * 8 * 8),
+    tf.keras.layers.Reshape((8, 8, -1)),
+    # 8x8
+    Residual(
+        UpBlock(pixel_size * 4 * 4 * 4 * 4),
+        tf.keras.layers.UpSampling2D(interpolation='bilinear')
+    ),
+    Residual(
+        UpBlock(pixel_size * 4 * 4 * 4),
+        tf.keras.layers.UpSampling2D(interpolation='bilinear')
+    ),
+    Residual(
+        UpBlock(pixel_size * 4 * 4),
+        tf.keras.layers.UpSampling2D(interpolation='bilinear')
+    ),
+    Residual(
+        UpBlock(pixel_size * 4),
+        tf.keras.layers.UpSampling2D(interpolation='bilinear')
+    ),
+    Residual(
+        UpBlock(pixel_size),
+        tf.keras.layers.UpSampling2D(interpolation='bilinear'),
+    ),
+    # 256x256
+    tf.keras.layers.Dense(pixel_size, activation='relu'),
+    tf.keras.layers.Dense(3),
 ])
-generator = tf.keras.Sequential([encoder, decoder])
-discriminator = Discriminator()
 
 @tf.function
 def train_step(source_images, target_images, step):
     target_images = tf.image.random_flip_left_right(target_images)
 
-    with tf.GradientTape(persistent=True) as tape:
-        #generated_images = decoder(tf.random.normal([batch_size, filters]))
-        generated_images = generator(target_images)
+    with tf.GradientTape() as tape:
+        code = encoder(target_images)
+
+        mean, log_scale = tf.split(code, 2, -1)
+
+        scale = tf.exp(log_scale)
+        code = tf.random.normal(tf.shape(mean), 0.0, 1.0) * scale + mean
+
+        generated_images = decoder(code)
 
         generator_loss = tf.keras.losses.MeanSquaredError()(
             generated_images, target_images
+        ) + 0.001 * tf.reduce_mean(
+            -0.5 * (
+                1 + 2 * log_scale - tf.square(mean) - 
+                tf.square(scale)
+            )
         )
 
-        #real_output = discriminator(target_images)
-        #fake_output = discriminator(generated_images)
-
-        #generator_loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)(
-        #    tf.ones_like(fake_output), fake_output
-        #)
-        #generator_loss = tf.keras.losses.MeanSquaredError()(0, fake_output)
-
-        #discriminator_loss = 0.5 * sum([
-        #    tf.keras.losses.BinaryCrossentropy(from_logits=True)(
-        #        tf.ones_like(real_output), real_output
-        #    ),
-        #    tf.keras.losses.BinaryCrossentropy(from_logits=True)(
-        #        tf.zeros_like(fake_output), fake_output
-        #    )
-        #])
-        #discriminator_loss = 0.5 * (
-        #    tf.keras.losses.MeanSquaredError()(1, real_output) +
-        #    tf.keras.losses.MeanSquaredError()(-1, fake_output)
-        #)
+    variables = decoder.trainable_variables + encoder.trainable_variables
 
     optimizer.apply_gradients(zip(
-        tape.gradient(generator_loss, generator.trainable_variables), 
-        generator.trainable_variables
+        tape.gradient(generator_loss, variables), variables
     ))
-    #optimizer.apply_gradients(zip(
-    #    tape.gradient(discriminator_loss, discriminator.trainable_variables), 
-    #    discriminator.trainable_variables
-    #))
 
 def load_file(file, crop=True):
     image = tf.image.decode_jpeg(tf.io.read_file(file))[:, :, :3]
     if crop:
         image = tf.image.random_crop(image, [size, size, 3])
     return tf.cast(image, tf.float32) / 128 - 1
-
-def get_encoding_summary(encoding):
-    return tf.clip_by_value(
-        tf.transpose(
-            encoding[..., :8], [2, 0, 1]
-        )[..., None] * 0.5 + 0.5, 
-        0, 1
-    )
 
 classes = [
     "../Datasets/safebooru_r63_256/train/male/*",
@@ -141,6 +176,7 @@ example = load_file(
     "../Datasets/safebooru_r63_256/test/female/" +
     "00af2f4796bcf58f445ab78e4f8a42f4931c28eec024de0e79872fa019575c5f.png"
 )
+noise = tf.random.normal((4, code_size))
 
 for folder in classes:
     dataset = tf.data.Dataset.list_files(folder)
@@ -152,25 +188,29 @@ name = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 summary_writer = tf.summary.create_file_writer(os.path.join("logs", name))
 
 progress = tqdm.tqdm(tf.data.Dataset.zip(tuple(datasets)))
-for step, (image_x, image_y) in enumerate(progress):
-    train_step(image_x, image_y, tf.constant(step, tf.int64))
-    
-    if step % 500 == 0:
-        with summary_writer.as_default():
-            #tf.summary.scalar('generator_loss', generator_loss, step)
-            #tf.summary.scalar('discriminator_loss', discriminator_loss, step)
-            tf.summary.image(
-                'fakes', 
-                tf.clip_by_value(
-                    generator(
-                        example[None]
-                    ) * 0.5 + 0.5, 
-                    0, 1
-                ), 
-                step, 4
-            )
-            for i, model in enumerate([encoder.layers[0].bias]):
-                encoding = get_encoding_summary(model)
+try:
+    for step, (image_x, image_y) in enumerate(progress):
+        train_step(image_x, image_y, tf.constant(step, tf.int64))
+        
+        if step % 500 == 0:
+            with summary_writer.as_default():
                 tf.summary.image(
-                    'encoding/' + str(i), encoding, step, 8
+                    'reconstructed', 
+                    tf.clip_by_value(
+                        decoder(
+                            encoder(example[None])[..., :code_size]
+                        ) * 0.5 + 0.5, 
+                        0, 1
+                    ), 
+                    step, 4
                 )
+                tf.summary.image(
+                    'fakes', 
+                    tf.clip_by_value(
+                        decoder(noise) * 0.5 + 0.5, 
+                        0, 1
+                    ), 
+                    step, 4
+                )
+finally:
+    pass
