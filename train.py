@@ -6,14 +6,32 @@ import tqdm
 
 size = 256
 pixel_size = 64
+code_size = 256
 
 batch_size = 8
 
-gpu = tf.config.experimental.list_physical_devices('GPU')[0]
+gpu = tf.config.list_physical_devices('GPU')[0]
 tf.config.experimental.set_memory_growth(gpu, True)
 
+policy = tf.keras.mixed_precision.Policy('mixed_float16')
+tf.keras.mixed_precision.experimental.set_policy(policy)
+
 #optimizer = tf.keras.optimizers.Adam()
-optimizer = tf.keras.optimizers.RMSprop(1e-4)
+optimizer_g = tf.keras.optimizers.RMSprop(1e-4)
+optimizer_d = tf.keras.optimizers.RMSprop(1e-4)
+
+optimizer_g, optimizer_d = [
+    tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
+    for optimizer in [optimizer_g, optimizer_d]
+]
+
+class PairwiseSum(tf.keras.layers.Layer):
+    def __init__(self):
+        super().__init__()
+
+    def call(self, input):
+        a, b = tf.split(input, 2, 0)
+        return a + b
 
 class Residual(tf.keras.layers.Layer):
     def __init__(self, module):
@@ -65,13 +83,10 @@ class DownShuffle(tf.keras.layers.Layer):
     def call(self, input):
         return tf.nn.space_to_depth(input, self.size)
 
-denoiser = tf.keras.Sequential([
-    tf.keras.layers.Dense(pixel_size, activation='relu'),
-    tf.keras.layers.Dense(pixel_size),
-    # 256x256
-    # DownShuffle(32) is not equivalent! 
-    DownShuffle(2), DownShuffle(2), DownShuffle(2),
-    DownShuffle(2), DownShuffle(2),
+generator = tf.keras.Sequential([
+    tf.keras.layers.Dense(code_size, activation='relu'),
+    tf.keras.layers.Dense(4 * 256 * 256),
+    tf.keras.layers.Reshape((8, 8, -1)),
     # 8x8
     Residual(Block(pixel_size)), UpShuffle(2),
     Residual(Block(pixel_size)), UpShuffle(2),
@@ -84,23 +99,64 @@ denoiser = tf.keras.Sequential([
     tf.keras.layers.Dense(3),
 ])
 
+discriminator = tf.keras.Sequential([
+    tf.keras.layers.Dense(pixel_size, activation='relu'),
+    tf.keras.layers.Dense(3),
+    # 256x256
+    Residual(Block(pixel_size)), DownShuffle(2),
+    Residual(Block(pixel_size)), DownShuffle(2),
+    Residual(Block(pixel_size)), DownShuffle(2),
+    Residual(Block(pixel_size)), DownShuffle(2),
+    Residual(Block(pixel_size)), DownShuffle(2),
+    Residual(Block(pixel_size)), 
+    # 8x8
+    tf.keras.layers.Reshape((-1,)),
+    tf.keras.layers.Dense(code_size, activation='relu'),
+    PairwiseSum(),
+    tf.keras.layers.Dense(code_size, activation='relu'),
+    tf.keras.layers.Dense(1, kernel_initializer='zeros'),
+])
+
 @tf.function
 def train_step(source_images, target_images, step):
     target_images = tf.image.random_flip_left_right(target_images)
 
-    with tf.GradientTape() as tape:
-        generated_images = denoiser(
-            tf.random.normal(tf.shape(target_images), target_images, 1.0)
+    with tf.GradientTape(persistent=True) as tape:
+        generated_images = generator(
+            tf.random.normal((batch_size, code_size))
         )
 
-        generator_loss = tf.keras.losses.MeanSquaredError()(
-            generated_images, target_images
+        real_output = discriminator(target_images)
+        fake_output = discriminator(generated_images)
+
+        #generator_loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)(
+        #    tf.ones_like(fake_output), fake_output
+        #)
+        #generator_loss = tf.keras.losses.MeanSquaredError()(0, fake_output)
+        generator_loss = tf.reduce_mean(
+            -0.5 * fake_output + tf.math.softplus(fake_output)
         )
 
-    variables = denoiser.trainable_variables
+        discriminator_loss = 0.5 * sum([
+            tf.keras.losses.BinaryCrossentropy(from_logits=True)(
+                tf.ones_like(real_output), real_output
+            ),
+            tf.keras.losses.BinaryCrossentropy(from_logits=True)(
+                tf.zeros_like(fake_output), fake_output
+            )
+        ])
+        #discriminator_loss = 0.5 * (
+        #    tf.keras.losses.MeanSquaredError()(1, real_output) +
+        #    tf.keras.losses.MeanSquaredError()(-1, fake_output)
+        #)
 
-    optimizer.apply_gradients(zip(
-        tape.gradient(generator_loss, variables), variables
+    optimizer_g.apply_gradients(zip(
+        tape.gradient(generator_loss, generator.trainable_variables), 
+        generator.trainable_variables
+    ))
+    optimizer_d.apply_gradients(zip(
+        tape.gradient(discriminator_loss, discriminator.trainable_variables), 
+        discriminator.trainable_variables
     ))
 
 def load_file(file, crop=True):
@@ -116,15 +172,11 @@ classes = [
 
 datasets = []
 
-example_a = load_file(
+example = load_file(
     "../Datasets/safebooru_r63_256/train/male/" +
     "00fdb833c64d7824edaa555277e494331b3882891f9422c6bca07611a5193b5f.png"
 )
-example_b = load_file(
-    "../Datasets/safebooru_r63_256/test/female/" +
-    "00af2f4796bcf58f445ab78e4f8a42f4931c28eec024de0e79872fa019575c5f.png"
-)
-example_b = tf.random.normal(tf.shape(example_b), example_b, 1.0)
+example = tf.random.normal((4, code_size))
 
 for folder in classes:
     dataset = tf.data.Dataset.list_files(folder)
@@ -145,15 +197,7 @@ try:
                 tf.summary.image(
                     'fakes', 
                     tf.clip_by_value(
-                        denoiser(example_a[None]) * 0.5 + 0.5, 
-                        0, 1
-                    ), 
-                    step, 4
-                )
-                tf.summary.image(
-                    'denoised', 
-                    tf.clip_by_value(
-                        denoiser(example_b[None]) * 0.5 + 0.5, 
+                        generator(example) * 0.5 + 0.5, 
                         0, 1
                     ), 
                     step, 4
