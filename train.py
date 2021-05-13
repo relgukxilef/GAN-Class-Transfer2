@@ -1,17 +1,23 @@
 
 import datetime, os
 import tensorflow as tf
-import tqdm
 
-filters = 128
-color_size = 8
+import tensorflow.keras.mixed_precision.experimental
+
+filters = 1024
+color_size = 4
+size = 128
 layers = 1
 
-batch_size = 1
-steps_per_epoch = 2000
+batch_size = 8
+steps_per_epoch = 4000
 
 gpu = tf.config.experimental.list_physical_devices('GPU')[0]
 tf.config.experimental.set_memory_growth(gpu, True)
+
+tensorflow.keras.mixed_precision.experimental.set_policy(
+    tensorflow.keras.mixed_precision.experimental.Policy('mixed_float16')
+)
 
 def mean_and_difference_distribution(parameters):
     # parameters[batch, height, width, channel, parameter]
@@ -31,11 +37,20 @@ def categorical_sample(logits):
 class Generator(tf.keras.Model):
     def __init__(self):
         super().__init__()
-        self.dense_in = [tf.keras.layers.Dense(filters) for _ in range(layers)]
+        # TODO: dense_in doesn't need bias
+        self.dense_in = [
+            tf.keras.layers.Dense(filters, use_bias=False) 
+            for _ in range(layers)
+        ]
         self.dense_final = tf.keras.layers.Dense(color_size)
         self.positional_encoding = tf.Variable(
-            initial_value=tf.zeros([256 * 256 * 3, filters]),
+            initial_value=tf.random.normal([size * size * 3, filters]),
             trainable=True,
+        )
+        length = size * size * 3
+        self.factor = tf.cast(
+            1 / tf.range(1, length + 1, dtype=tf.float32)[:, None], 
+            dtype=tf.float16
         )
 
 
@@ -53,21 +68,18 @@ class Generator(tf.keras.Model):
         )
         # x[batch, height * width * channel, 1]
 
-        #factor = 1 / tf.range(1, length + 1, dtype=tf.float32)[:, None]
-
         x = x * 2 - 1
         
-        for i in range(layers):
-            x = self.dense_in[i](x)
+        # TODO: maybe try using an embedding for the discrete input
+        x = self.dense_in[0](x)
 
-            if i == 0:
-                x += self.positional_encoding
+        x += tf.cast(self.positional_encoding, dtype=x.dtype)
 
-            x = tf.nn.relu(x)
-            
-            #x = tf.math.cumsum(x, -2) * factor # prefix mean
-            #x = tf.concat([x, tf.math.cumsum(x, -2) / 256 / 256 / 3], -1)
-            x = tf.math.l2_normalize(tf.math.cumsum(x, -2), -1)
+        x = tf.nn.relu(x)
+        
+        x = tf.math.cumsum(x, -2) * self.factor # prefix mean
+        #x = tf.concat([x, tf.math.cumsum(x, -2) / size / size / 3], -1)
+        #x = tf.math.l2_normalize(tf.math.cumsum(x, -2), -1)
 
         x = self.dense_final(x)
 
@@ -75,47 +87,47 @@ class Generator(tf.keras.Model):
             x, tf.concat([shape, [color_size]], 0)
         )
 
-        return x
+        return tf.cast(x, dtype=tf.float32)
 
     @tf.function
     def sample(self):
-        length = 256 * 256 * 3
-
         @tf.function
-        def value(a, p):
+        def value(a, element):
             x, sums = a
+            p, f = element
             sums = sums[:]
 
             x = x * 2 - 1
 
-            for i in range(layers):
-                x = self.dense_in[i](x)
+            x = self.dense_in[0](x)
 
-                if i == 0:
-                    x += p
+            x += p
 
-                x = tf.nn.relu(x)
+            x = tf.nn.relu(x)
 
-                sums[i] += x
-                #x = sums[i] * f
-                x = tf.math.l2_normalize(sums[i], -1)
-                #x = tf.concat([x, sums[i] / 256 / 256 / 3], -1)
+            sums[0] += x
+            x = sums[0] * f
+            #x = tf.math.l2_normalize(sums[0], -1)
+            #x = tf.concat([x, sums[0] / size / size / 3], -1)
             
             x = self.dense_final(x)
 
             x = (
-                tf.cast(categorical_sample(x), tf.float32)[..., None] / 
+                tf.cast(categorical_sample(x), tf.float16)[..., None] / 
                 color_size
             )
 
             return (x, sums)
 
         fake = tf.scan(
-            value, self.positional_encoding, 
-            (tf.zeros([1, 1]), [tf.zeros([1, filters])] * layers)
+            value, (tf.cast(self.positional_encoding, tf.float16), self.factor), 
+            (
+                tf.zeros([1, 1], dtype=tf.float16), 
+                [tf.zeros([1, filters], dtype=tf.float16)] * layers
+            )
         )[0]
 
-        x = tf.reshape(fake, [256, 256, 3])
+        x = tf.reshape(fake, [size, size, 3])
 
         return x
 
@@ -128,7 +140,7 @@ def prepare_example(file, crop=True):
     image = tf.image.decode_jpeg(file)[:, :, :3]
     image = tf.cast(image, tf.int32) * color_size // 256
     if crop:
-        image = tf.image.random_crop(image, [256, 256, 3])
+        image = tf.image.random_crop(image, [size, size, 3])
     shape = tf.shape(image)
     y = tf.reshape(
         image, 
@@ -153,7 +165,7 @@ example = prepare_example(load_file(
 for i, folder in enumerate(classes):
     dataset = tf.data.Dataset.list_files(folder)
     dataset = dataset.map(load_file).repeat()
-    dataset = dataset.map(prepare_example).batch(batch_size)
+    dataset = dataset.map(prepare_example).batch(batch_size).prefetch(16)
     datasets += [dataset]
 
 name = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
@@ -189,7 +201,9 @@ fake = model.sample()
 
 
 model.compile(
-    tf.keras.optimizers.Adam(1e-4),
+    tf.keras.mixed_precision.LossScaleOptimizer(
+        tf.keras.optimizers.Adam(1e-4)
+    ),
     #tf.keras.optimizers.SGD(0.1, 0.9, True),
     tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
     []
