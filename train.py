@@ -6,40 +6,39 @@ import tensorflow.keras.mixed_precision.experimental
 
 filters = 512
 color_size = 4
-size = 128
-layers = 1
+size = 64
 
-batch_size = 8
-steps_per_epoch = 10
+batch_size = 4
+steps_per_epoch = 4000
 
 gpu = tf.config.experimental.list_physical_devices('GPU')[0]
 tf.config.experimental.set_memory_growth(gpu, True)
 
-tensorflow.keras.mixed_precision.experimental.set_policy(
-    tensorflow.keras.mixed_precision.experimental.Policy('mixed_float16')
-)
-
-def mean_and_difference_distribution(parameters):
-    # parameters[batch, height, width, channel, parameter]
-    mean = parameters[..., :1]
-    differences = tf.math.softplus(parameters[..., 1:])
-    #differences = tf.nn.relu(parameters[..., 1:])
-    offsets = tf.math.cumsum(differences, -1)
-    mean_offset = tf.reduce_mean(offsets, -1, keepdims=True)
-    return tf.concat([mean, mean + offsets], -1) - mean_offset
+#tensorflow.keras.mixed_precision.experimental.set_policy(
+#    tensorflow.keras.mixed_precision.experimental.Policy('mixed_float16')
+#)
 
 def categorical_sample(logits):
     return tf.reshape(tf.random.categorical(
         tf.reshape(logits, [-1, tf.shape(logits)[-1]]), 
-        1
+        1, tf.int32
     ), tf.shape(logits)[:-1])
 
 class Generator(tf.keras.Model):
     def __init__(self):
         super().__init__()
         self.length = size * size * 3
-        self.dense_in = tf.keras.layers.Conv1D(filters, self.length)
-        self.dense_final = tf.keras.layers.Dense(color_size)
+        self.kernel = tf.Variable(
+            initial_value=tf.random.normal([filters, self.length]),
+            trainable=True,
+        )
+        self.bias = tf.Variable(
+            initial_value=tf.zeros([filters]),
+            trainable=True,
+        )
+        self.dense_final = tf.keras.layers.Dense(
+            color_size, kernel_initializer='zeros'
+        )
 
 
     @tf.function
@@ -54,10 +53,21 @@ class Generator(tf.keras.Model):
         )
         # x[batch, height * width * channel, 1]
 
-        x = tf.pad(x, [[0, 0], [self.length, 0], [0, 0]])[:, :-1, :]
+        # FFT only works on inner-most axis
+        x = tf.transpose(x, [0, 2, 1])
 
-        x = self.dense_in(x)
-        # TODO: try this with FFT
+        # x[batch, 1, height * width * channel]
+
+        x = tf.signal.rfft(x, [self.length * 2])
+        kernel = tf.signal.rfft(self.kernel, [self.length * 2])
+
+        x *= kernel
+
+        x = tf.signal.irfft(x, [self.length * 2])[..., :self.length]
+
+        x = tf.transpose(x, [0, 2, 1])
+
+        x += self.bias
 
         x = tf.nn.relu(x)
         
@@ -71,21 +81,21 @@ class Generator(tf.keras.Model):
 
     @tf.function
     def sample(self):
+        kernel = self.kernel[..., ::-1] # fft interprets kernel mirrored
+
         @tf.function
         def value(buffer):
-            x = buffer
+            x = tf.tensordot(buffer, kernel, [[-2], [-1]])
 
-            x = x * 2 - 1
-
-            x = self.dense_in(x)
+            x += self.bias
 
             x = tf.nn.relu(x)
 
             x = self.dense_final(x)
 
             x = (
-                tf.cast(categorical_sample(x), tf.float16)[..., None] / 
-                color_size
+                tf.cast(categorical_sample(x)[..., None], tf.float32) / 
+                color_size * 2 - 1
             )
 
             x = tf.concat([buffer[..., 1:, :], x], -2)
@@ -93,11 +103,11 @@ class Generator(tf.keras.Model):
             return (x,)
 
         fake = tf.while_loop(
-            lambda x: True, value, (tf.zeros([1, self.length, 1], tf.float16),), 
+            lambda x: True, value, (tf.zeros([2, self.length, 1]),), 
             maximum_iterations=self.length
-        )
+        )[0] * 0.5 + 0.5
 
-        x = tf.reshape(fake, [size, size, 3])
+        x = tf.reshape(fake, [-1, size, size, 3])
 
         return x
 
@@ -147,12 +157,12 @@ summary_writer = tf.summary.create_file_writer(log_folder)
 model = Generator()
 
 def log_sample(epochs, logs):
-    fake = model.sample()[None]
-
     prediction = model(example[0][None])
+    fake = model.sample() * color_size / (color_size - 1)
+
     prediction = tf.cast(
         categorical_sample(prediction), tf.float32
-    ) / color_size
+    ) / (color_size - 1)
 
     with summary_writer.as_default():
         tf.summary.image(
@@ -163,17 +173,17 @@ def log_sample(epochs, logs):
         )
     del fake, prediction
 
-prediction = model(example[0][None])
 #loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
 #    example[None], prediction
 #)
-fake = model.sample()
+log_sample(0, None)
 
 
 model.compile(
-    tf.keras.mixed_precision.LossScaleOptimizer(
-        tf.keras.optimizers.Adam(1e-4)
-    ),
+    tf.keras.optimizers.Adam(1e-4),
+    #tf.keras.mixed_precision.LossScaleOptimizer(
+    #    tf.keras.optimizers.Adam(1e-4)
+    #),
     #tf.keras.optimizers.SGD(0.1, 0.9, True),
     tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
     []
