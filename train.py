@@ -2,21 +2,15 @@
 import datetime, os
 import tensorflow as tf
 
-import tensorflow.keras.mixed_precision.experimental
-
 filters = 512
 color_size = 4
-size = 64
+size = 128
 
-batch_size = 4
+batch_size = 1
 steps_per_epoch = 4000
 
 gpu = tf.config.experimental.list_physical_devices('GPU')[0]
 tf.config.experimental.set_memory_growth(gpu, True)
-
-#tensorflow.keras.mixed_precision.experimental.set_policy(
-#    tensorflow.keras.mixed_precision.experimental.Policy('mixed_float16')
-#)
 
 def categorical_sample(logits):
     return tf.reshape(tf.random.categorical(
@@ -27,9 +21,9 @@ def categorical_sample(logits):
 class Generator(tf.keras.Model):
     def __init__(self):
         super().__init__()
-        self.length = size * size * 3
+        self.length = size * size
         self.kernel = tf.Variable(
-            initial_value=tf.random.normal([filters, self.length]),
+            initial_value=tf.random.normal([3, 3, filters, self.length]),
             trainable=True,
         )
         self.bias = tf.Variable(
@@ -40,6 +34,13 @@ class Generator(tf.keras.Model):
             color_size, kernel_initializer='zeros'
         )
 
+        # [channel, k, 1, space]
+        self.mask = [
+            [[[0]], [[0]], [[0]]], [[[1]], [[0]], [[0]]], [[[1]], [[1]], [[0]]]
+        ]
+        self.mask = tf.concat(
+            [self.mask, tf.ones([3, 3, 1, self.length - 1])], -1
+        )
 
     @tf.function
     def call(self, example):
@@ -49,23 +50,30 @@ class Generator(tf.keras.Model):
 
         x = tf.reshape(
             example, 
-            tf.concat([shape[:-3], [self.length, 1]], 0)
+            tf.concat([shape[:-3], [self.length, 3]], 0)
         )
-        # x[batch, height * width * channel, 1]
+        # x[batch, height * width, channel]
 
         # FFT only works on inner-most axis
         x = tf.transpose(x, [0, 2, 1])
 
-        # x[batch, 1, height * width * channel]
+        # x[batch, channel, height * width]
+        # kernel[channel, iteration, feature, height * width]
+
+        kernel = self.kernel * self.mask
 
         x = tf.signal.rfft(x, [self.length * 2])
-        kernel = tf.signal.rfft(self.kernel, [self.length * 2])
+        kernel = tf.signal.rfft(kernel, [self.length * 2])
 
-        x *= kernel
+        x = tf.einsum('...cs,cifs->...ifs', x, kernel)
 
         x = tf.signal.irfft(x, [self.length * 2])[..., :self.length]
+        
+        # [batch, iteration, feature, space]
 
-        x = tf.transpose(x, [0, 2, 1])
+        x = tf.transpose(x, [0, 3, 1, 2])
+        
+        # [batch, space, iteration, feature]
 
         x += self.bias
 
@@ -73,6 +81,7 @@ class Generator(tf.keras.Model):
         
         x = self.dense_final(x)
 
+        # TODO: try predicting the image differential instead
         x = tf.reshape(
             x, tf.concat([shape, [color_size]], 0)
         )
@@ -81,31 +90,51 @@ class Generator(tf.keras.Model):
 
     @tf.function
     def sample(self):
-        kernel = self.kernel[..., ::-1] # fft interprets kernel mirrored
+        kernel = self.kernel * self.mask
+        kernel = kernel[..., ::-1] # fft interprets kernel mirrored
 
         @tf.function
         def value(buffer):
-            x = tf.tensordot(buffer, kernel, [[-2], [-1]])
-
-            x += self.bias
-
-            x = tf.nn.relu(x)
-
-            x = self.dense_final(x)
-
-            x = (
-                tf.cast(categorical_sample(x)[..., None], tf.float32) / 
-                color_size * 2 - 1
+            # buffer[batch, channel, space]
+            # kernel[channel, iteration, feature, space]
+            pre_features = tf.einsum(
+                '...cs,cifs->...if', buffer[..., 1:], kernel[..., :-1]
             )
 
-            x = tf.concat([buffer[..., 1:, :], x], -2)
+            pre_features += self.bias
+
+            # pixel[batch, channel, space]
+            pixel = tf.zeros(buffer[..., 0:0, 0:1].shape)
+
+            for i in range(3):
+                x = pre_features[..., i:i+1, :]
+
+                if i > 0:
+                    x += tf.einsum(
+                        '...cs,cifs->...if', pixel, kernel[:i, i:i+1, :, -1:]
+                    )
+
+                x = tf.nn.relu(x)
+
+                x = self.dense_final(x)
+
+                x = (
+                    tf.cast(categorical_sample(x), tf.float32) / 
+                    color_size * 2 - 1
+                )[..., None]
+
+                pixel = tf.concat([pixel, x], -2) # channel dimension
+
+            x = tf.concat([buffer[..., :, 1:], pixel], -1) # space dimension
 
             return (x,)
 
         fake = tf.while_loop(
-            lambda x: True, value, (tf.zeros([2, self.length, 1]),), 
+            lambda x: True, value, (tf.zeros([2, 3, self.length]),), 
             maximum_iterations=self.length
         )[0] * 0.5 + 0.5
+
+        fake = tf.transpose(fake, [0, 2, 1])
 
         x = tf.reshape(fake, [-1, size, size, 3])
 
@@ -121,14 +150,7 @@ def prepare_example(file, crop=True):
     image = tf.cast(image, tf.int32) * color_size // 256
     if crop:
         image = tf.image.random_crop(image, [size, size, 3])
-    shape = tf.shape(image)
-    y = tf.reshape(
-        image, 
-        tf.concat([shape[:-3], [tf.reduce_prod(shape[-3:])]], 0)
-    )
-    y = tf.pad(y[..., :-1], [[1, 0]])
-    y = tf.reshape(y, shape)
-    return (y, image)
+    return (image, image)
 
 classes = [
     "../Datasets/safebooru_r63_256/train/male/*",
@@ -176,7 +198,7 @@ def log_sample(epochs, logs):
 #loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
 #    example[None], prediction
 #)
-log_sample(0, None)
+log_sample(-1, None)
 
 
 model.compile(
