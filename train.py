@@ -6,7 +6,7 @@ import tqdm
 size = 256
 filters = 512
 
-batch_size = 8
+batch_size = 1
 
 gpu = tf.config.experimental.list_physical_devices('GPU')[0]
 tf.config.experimental.set_memory_growth(gpu, True)
@@ -16,14 +16,19 @@ class Generator(tf.keras.Model):
         super().__init__()
         
         self.dense0 = tf.keras.layers.Dense(filters, use_bias=False)
-        self.dense1 = tf.keras.layers.Dense(3)
+        self.dense1 = tf.keras.layers.Dense(filters, activation='relu')
+        self.dense2 = tf.keras.layers.Dense(3, kernel_initializer='zeros')
+
         self.encoding = self.add_weight(
             "encoding",
+            initializer=tf.keras.initializers.RandomNormal(),
             shape=[size, size, filters]
         )
 
     def call(self, latent):
-        return self.dense1(tf.nn.relu(self.encoding + self.dense0(latent)))
+        return self.dense2(
+            self.dense1(tf.nn.relu(self.encoding + self.dense0(latent)))
+        )
 
 class Discriminator(tf.keras.Model):
     def __init__(self):
@@ -31,45 +36,63 @@ class Discriminator(tf.keras.Model):
         
         self.dense0 = tf.keras.layers.Dense(filters, use_bias=False)
         self.dense1 = tf.keras.layers.Dense(filters)
-        self.dense2 = tf.keras.layers.Dense(1)
+        self.dense2 = tf.keras.layers.Dense(filters)
+        self.dense3 = tf.keras.layers.Dense(filters)
+        self.dense4 = tf.keras.layers.Dense(1, kernel_initializer='zeros')
+
         self.encoding = self.add_weight(
             "encoding",
+            initializer=tf.keras.initializers.RandomNormal(),
             shape=[size, size, filters]
         )
 
     def call(self, image):
         x = tf.nn.relu(self.encoding + self.dense0(image))
-        x = tf.reduce_mean(x, [-2, -3], keepdims=True)
         x = tf.nn.relu(self.dense1(x))
 
-        return self.dense2(x)
+        x = tf.reduce_mean(x, [-2, -3], keepdims=True)
+
+        x = tf.nn.relu(self.dense2(x))
+        x = tf.nn.relu(self.dense3(x))
+
+        return self.dense4(x)
             
 
-optimizer = tf.keras.optimizers.RMSprop()
+optimizer = tf.keras.optimizers.Adam(1e-5, 0, 0.99)
 
 generator = Generator()
 discriminator = Discriminator()
 
 @tf.function
 def train_step(source_images, target_images, step):
+    target_images = tf.image.random_flip_left_right(target_images)
+
     with tf.GradientTape(persistent=True) as tape:
         generated_images = generator(tf.random.normal([1, 1, filters]))
 
         real_output = discriminator(target_images)
         fake_output = discriminator(generated_images)
 
-        generator_loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)(
-            tf.ones_like(fake_output), fake_output
-        )
+        #generator_loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)(
+        #    tf.ones_like(fake_output), fake_output
+        #)
+        generator_loss = tf.keras.losses.MeanSquaredError()(0, fake_output)
+        #generator_loss = tf.reduce_mean(
+        #    -0.5 * fake_output + tf.math.softplus(fake_output)
+        #)
 
-        discriminator_loss = sum([
-            tf.keras.losses.BinaryCrossentropy(from_logits=True)(
-                tf.ones_like(real_output), real_output
-            ),
-            tf.keras.losses.BinaryCrossentropy(from_logits=True)(
-                tf.zeros_like(fake_output), fake_output
-            )
-        ])
+        #discriminator_loss = 0.5 * sum([
+        #    tf.keras.losses.BinaryCrossentropy(from_logits=True)(
+        #        tf.ones_like(real_output), real_output
+        #    ),
+        #    tf.keras.losses.BinaryCrossentropy(from_logits=True)(
+        #        tf.zeros_like(fake_output), fake_output
+        #    )
+        #])
+        discriminator_loss = 0.5 * (
+            tf.keras.losses.MeanSquaredError()(1, real_output) +
+            tf.keras.losses.MeanSquaredError()(-1, fake_output)
+        )
 
     optimizer.apply_gradients(zip(
         tape.gradient(generator_loss, generator.trainable_variables), 
