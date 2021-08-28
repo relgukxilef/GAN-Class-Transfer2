@@ -128,8 +128,13 @@ def train_step(source_images, target_images, step):
             tf.random.normal((batch_size, code_size))
         )
 
+        tf.debugging.check_numerics(generated_images, "generated_images")
+
         real_output = discriminator(target_images)
         fake_output = discriminator(generated_images)
+
+        tf.debugging.check_numerics(real_output, "real_output")
+        tf.debugging.check_numerics(fake_output, "fake_output")
 
         #generator_loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)(
         #    tf.ones_like(fake_output), fake_output
