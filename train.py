@@ -72,7 +72,7 @@ class UpShuffle(tf.keras.layers.Layer):
         self.size = size
 
     def call(self, input):
-        return tf.keras.layers.UpSampling2D()(input)
+        return tf.keras.layers.UpSampling2D(interpolation='bilinear')(input)
 
 class DownShuffle(tf.keras.layers.Layer):
     def __init__(self, size):
