@@ -201,13 +201,15 @@ try:
         
         if step % 100 == 0:
             with summary_writer.as_default():
+                fakes = generator(example)
                 tf.summary.image(
                     'fakes', 
                     tf.clip_by_value(
-                        generator(example) * 0.5 + 0.5, 
+                        fakes * 0.5 + 0.5, 
                         0, 1
                     ), 
                     step, 4
                 )
+                tf.summary.histogram('fake_score', discriminator(fakes), step)
 finally:
     pass
