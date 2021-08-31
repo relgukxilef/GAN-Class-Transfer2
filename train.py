@@ -5,7 +5,6 @@ import tensorflow_probability as tfp
 
 size = 256
 pixel_size = 128
-code_size = 128
 
 batch_size = 1
 
@@ -85,22 +84,6 @@ class Decoder(tf.keras.layers.Layer):
         scale = tf.reduce_mean(scale, axis=[-1, -2, -3], keepdims=True)
         return rgb, scale
 
-class Noiser(tf.keras.layers.Layer):
-    def __init__(self):
-        super().__init__()
-
-    def call(self, input):
-        log_scale = tf.random.uniform(
-            tf.shape(input)[:-3], 
-            tf.math.log(1.0/256), tf.math.log(1.0)
-        )[..., None, None, None]
-        scale = tf.exp(log_scale)
-        noised = (
-            input * tf.sqrt(1 - tf.square(scale)) + 
-            tf.random.normal(tf.shape(input)) * scale
-        )
-        return noised, log_scale
-
 @tf.function
 def identity(y_true, y_pred):
     return tf.reduce_mean(y_pred)
@@ -130,11 +113,22 @@ class Trainer(tf.keras.Model):
     def __init__(self, denoiser):
         super().__init__()
 
-        self.noiser = Noiser()
         self.denoiser = denoiser
 
     def call(self, input):
-        rgb, log_scale = self.denoiser(self.noiser(input))
+        log_scale = tf.math.log(tf.random.uniform(
+            tf.shape(input)[:-3], 
+            1.0/256, 1.0
+        ))[..., None, None, None]
+        scale = tf.exp(log_scale)
+        epsilon = tf.random.normal(tf.shape(input))
+
+        noised = (
+            input * tf.sqrt(1 - tf.square(scale)) + 
+            epsilon * scale
+        )
+
+        rgb, log_scale = self.denoiser((noised, log_scale))
         return -tfp.distributions.Normal(
             rgb, tf.exp(log_scale)
         ).log_prob(input)
@@ -156,7 +150,7 @@ classes = [
 
 datasets = []
 
-example = load_file(
+example_image = load_file(
     "../Datasets/safebooru_r63_256/train/male/" +
     "00fdb833c64d7824edaa555277e494331b3882891f9422c6bca07611a5193b5f.png"
 )
@@ -171,15 +165,29 @@ for folder in classes:
 @tf.function
 def log_sample(epochs, logs):
     with summary_writer.as_default():
-        step = example, tf.math.log(1.0)[None, None, None, None]
+        identity, _ = denoiser((
+            example_image[0][None], 
+            tf.math.log(1.0 / 256)[None, None, None, None]
+        ))
+        tf.summary.image('identity', identity * 0.5 + 0.5, epochs)
+        del identity
+
+        sample = example
+        log_scale = tf.math.log(1.0)[None, None, None, None]
         for i in range(20):
-            fake, log_scale = denoiser(step)
-            step = (
-                tf.random.normal(example.shape, fake, tf.exp(log_scale)), 
-                log_scale
+            fake, log_scale = denoiser((sample, log_scale))
+            scale = tf.exp(log_scale)
+            epsilon = tf.random.normal(tf.shape(fake))
+
+            sample = (
+                fake * tf.sqrt(1 - tf.square(scale)) + 
+                epsilon * scale
             )
+
+            if i == 0:
+                tf.summary.image('first_step', fake * 0.5 + 0.5, epochs, 4)
         tf.summary.image('fake', fake * 0.5 + 0.5, epochs, 4)
-        tf.summary.image('sample', step[0] * 0.5 + 0.5, epochs, 4)
+        tf.summary.image('sample', sample * 0.5 + 0.5, epochs, 4)
         tf.summary.histogram('log_scale', log_scale, epochs)
 
 if __name__ == "__main__":
@@ -193,7 +201,8 @@ if __name__ == "__main__":
     del loss, dataset_example
 
     trainer.compile(
-        tf.keras.optimizers.SGD(1e-4), 
+        #tf.keras.optimizers.SGD(1e-5), 
+        tf.keras.optimizers.Adam(1e-6), 
         identity
     )
 
