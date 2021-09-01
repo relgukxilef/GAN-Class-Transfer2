@@ -5,18 +5,26 @@ import tensorflow_probability as tfp
 
 size = 256
 pixel_size = 128
+block_depth = 2
 
 batch_size = 1
+
+residual = False
+
+mixed_precision = False
+
 
 gpu = tf.config.list_physical_devices('GPU')[0]
 tf.config.experimental.set_memory_growth(gpu, True)
 
-policy = tf.keras.mixed_precision.Policy('mixed_float16')
-#tf.keras.mixed_precision.experimental.set_policy(policy)
+if mixed_precision:
+    policy = tf.keras.mixed_precision.Policy('mixed_float16')
+    tf.keras.mixed_precision.experimental.set_policy(policy)
 
 optimizer = tf.keras.optimizers.Adam()
 
-#optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
+if mixed_precision:
+    optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
 
 class Residual(tf.keras.layers.Layer):
     def __init__(self, module):
@@ -28,8 +36,11 @@ class Residual(tf.keras.layers.Layer):
         self.module.build(input_shape)
 
     def call(self, input):
-        #return self.module(input)
-        return input + self.module(input)
+        if residual:
+            # TODO: add dense layer after module
+            return input + self.module(input)
+        else:
+            return self.module(input)
 
 class Block(tf.keras.layers.Layer):
     def __init__(self, filters, dilation = 1):
@@ -43,16 +54,30 @@ class Block(tf.keras.layers.Layer):
             tf.keras.layers.Conv2D(
                 self.filters, 3, 1, 'same', activation='relu', 
                 dilation_rate=(self.dilation, self.dilation)
-            ),
-            tf.keras.layers.Conv2D(
-                input_shape[-1], 3, 1, 'same', #kernel_initializer='zeros',
-                dilation_rate=(self.dilation, self.dilation)
-            )
+            ) for i in range(block_depth)
         ])
         self.module.build(input_shape)
 
     def call(self, input):
         return self.module(input)
+
+class UpShuffle(tf.keras.layers.Layer):
+    def __init__(self, size):
+        super().__init__()
+
+        self.size = size
+
+    def call(self, input):
+        return tf.nn.depth_to_space(input, self.size)
+
+class DownShuffle(tf.keras.layers.Layer):
+    def __init__(self, size):
+        super().__init__()
+
+        self.size = size
+
+    def call(self, input):
+        return tf.nn.space_to_depth(input, self.size)
 
 class Encoder(tf.keras.layers.Layer):
     def __init__(self):
@@ -199,12 +224,12 @@ if __name__ == "__main__":
 
     trainer.compile(
         #tf.keras.optimizers.SGD(1e-5), 
-        tf.keras.optimizers.Adam(1e-6), 
+        tf.keras.optimizers.Adam(1e-4), 
         identity
     )
 
     trainer.fit(
-        datasets[1], steps_per_epoch=1000, epochs=100,
+        datasets[1], steps_per_epoch=1000, epochs=1000,
         callbacks=[
             tf.keras.callbacks.LambdaCallback(
                 on_epoch_begin=log_sample
