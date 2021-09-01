@@ -176,13 +176,10 @@ def log_sample(epochs, logs):
         log_scale = tf.math.log(1.0)[None, None, None, None]
         for i in range(20):
             fake, log_scale = denoiser((sample, log_scale))
-            scale = tf.exp(log_scale)
-            epsilon = tf.random.normal(tf.shape(fake))
 
-            sample = (
-                fake * tf.sqrt(1 - tf.square(scale)) + 
-                epsilon * scale
-            )
+            sample = tfp.distributions.Normal(
+                fake, tf.exp(log_scale)
+            ).sample([])
 
             if i == 0:
                 tf.summary.image('first_step', fake * 0.5 + 0.5, epochs, 4)
