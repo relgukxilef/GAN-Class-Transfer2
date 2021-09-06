@@ -7,9 +7,9 @@ size = 256
 pixel_size = 128
 block_depth = 2
 
-batch_size = 1
+batch_size = 2
 
-residual = False
+residual = True
 
 mixed_precision = False
 
@@ -21,7 +21,7 @@ if mixed_precision:
     policy = tf.keras.mixed_precision.Policy('mixed_float16')
     tf.keras.mixed_precision.experimental.set_policy(policy)
 
-optimizer = tf.keras.optimizers.Adam()
+optimizer = tf.keras.optimizers.Adam(1e-6)
 
 if mixed_precision:
     optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
@@ -34,11 +34,12 @@ class Residual(tf.keras.layers.Layer):
 
     def build(self, input_shape):
         self.module.build(input_shape)
+        if residual:
+            self.dense = tf.keras.layers.Dense(input_shape[-1], use_bias=False)
 
     def call(self, input):
         if residual:
-            # TODO: add dense layer after module
-            return input + self.module(input)
+            return input + self.dense(self.module(input))
         else:
             return self.module(input)
 
@@ -62,22 +63,18 @@ class Block(tf.keras.layers.Layer):
         return self.module(input)
 
 class UpShuffle(tf.keras.layers.Layer):
-    def __init__(self, size):
+    def __init__(self):
         super().__init__()
 
-        self.size = size
-
     def call(self, input):
-        return tf.nn.depth_to_space(input, self.size)
+        return tf.keras.layers.UpSampling2D(interpolation='bilinear')(input)
 
 class DownShuffle(tf.keras.layers.Layer):
-    def __init__(self, size):
+    def __init__(self):
         super().__init__()
 
-        self.size = size
-
     def call(self, input):
-        return tf.nn.space_to_depth(input, self.size)
+        return tf.keras.layers.AveragePooling2D()(input)
 
 class Encoder(tf.keras.layers.Layer):
     def __init__(self):
@@ -118,14 +115,21 @@ class Denoiser(tf.keras.Model):
         super().__init__()
 
         self.encoder = Encoder()
+        self.middle = Block(pixel_size)
+        for i in range(7):
+            self.middle = Residual(
+                tf.keras.Sequential([
+                    DownShuffle(),
+                    Block(pixel_size),
+                    self.middle, 
+                    Block(pixel_size),
+                    UpShuffle(),
+                ])
+            )
         self.middle = tf.keras.Sequential([
-            Residual(Block(pixel_size, 64)),
-            Residual(Block(pixel_size, 32)),
-            Residual(Block(pixel_size, 16)),
-            Residual(Block(pixel_size, 8)),
-            Residual(Block(pixel_size, 4)),
-            Residual(Block(pixel_size, 2)),
-            Residual(Block(pixel_size)), 
+            Block(pixel_size),
+            self.middle,
+            Block(pixel_size),
             tf.keras.layers.Dense(pixel_size, activation='relu'),
             tf.keras.layers.Dense(4),
         ])
@@ -149,7 +153,7 @@ class Trainer(tf.keras.Model):
         epsilon = tf.random.normal(tf.shape(input))
 
         noised = (
-            input * tf.sqrt(1 - tf.square(scale)) + 
+            input +# * tf.sqrt(1 - tf.square(scale)) + 
             epsilon * scale
         )
 
@@ -223,8 +227,7 @@ if __name__ == "__main__":
     del loss, dataset_example
 
     trainer.compile(
-        #tf.keras.optimizers.SGD(1e-5), 
-        tf.keras.optimizers.Adam(1e-4), 
+        optimizer, 
         identity
     )
 
