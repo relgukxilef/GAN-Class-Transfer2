@@ -145,21 +145,21 @@ class Trainer(tf.keras.Model):
         self.denoiser = denoiser
 
     def call(self, input):
-        log_scale = tf.math.log(tf.random.uniform(
+        log_scale = tf.random.uniform(
             tf.shape(input)[:-3], 
-            1.0/256, 1.0
-        ))[..., None, None, None]
+            tf.math.log(1.0/256), tf.math.log(1.0)
+        )[..., None, None, None]
         scale = tf.exp(log_scale)
         epsilon = tf.random.normal(tf.shape(input))
 
         noised = (
-            input +# * tf.sqrt(1 - tf.square(scale)) + 
+            input * tf.sqrt(1 - tf.square(scale)) + 
             epsilon * scale
         )
 
-        rgb, log_scale = self.denoiser((noised, log_scale))
+        fake, log_scale = self.denoiser((noised, log_scale))
         return -tfp.distributions.Normal(
-            rgb, tf.exp(log_scale)
+            fake, tf.exp(log_scale)
         ).log_prob(input)
 
 denoiser = Denoiser()
@@ -206,9 +206,12 @@ def log_sample(epochs, logs):
         for i in range(20):
             fake, log_scale = denoiser((sample, log_scale))
 
-            sample = tfp.distributions.Normal(
-                fake, tf.exp(log_scale)
-            ).sample([])
+            epsilon = tf.random.normal(tf.shape(fake))
+            scale = tf.exp(log_scale)
+            sample = (
+                fake * tf.sqrt(1 - tf.square(scale)) + 
+                epsilon * scale
+            )
 
             if i == 0:
                 tf.summary.image('first_step', fake * 0.5 + 0.5, epochs, 4)
