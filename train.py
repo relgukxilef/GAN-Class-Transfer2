@@ -7,7 +7,8 @@ size = 256
 pixel_size = 128
 block_depth = 2
 
-batch_size = 2
+batch_size = 8
+steps = 20
 
 residual = True
 
@@ -21,7 +22,7 @@ if mixed_precision:
     policy = tf.keras.mixed_precision.Policy('mixed_float16')
     tf.keras.mixed_precision.experimental.set_policy(policy)
 
-optimizer = tf.keras.optimizers.Adam(1e-6)
+optimizer = tf.keras.optimizers.Adam(1e-5)
 
 if mixed_precision:
     optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
@@ -131,12 +132,11 @@ class Denoiser(tf.keras.Model):
             self.middle,
             Block(pixel_size),
             tf.keras.layers.Dense(pixel_size, activation='relu'),
-            tf.keras.layers.Dense(4),
+            tf.keras.layers.Dense(3),
         ])
-        self.decoder = Decoder()
 
     def call(self, input):
-        return self.decoder(self.middle(self.encoder(input)))
+        return self.middle(self.encoder(input))
 
 class Trainer(tf.keras.Model):
     def __init__(self, denoiser):
@@ -157,10 +157,8 @@ class Trainer(tf.keras.Model):
             epsilon * scale
         )
 
-        fake, log_scale = self.denoiser((noised, log_scale))
-        return -tfp.distributions.Normal(
-            fake, tf.exp(log_scale)
-        ).log_prob(input)
+        fake = self.denoiser((noised, log_scale))
+        return tf.math.squared_difference(fake, input)
 
 denoiser = Denoiser()
 trainer = Trainer(denoiser)
@@ -194,7 +192,7 @@ for folder in classes:
 @tf.function
 def log_sample(epochs, logs):
     with summary_writer.as_default():
-        identity, _ = denoiser((
+        identity = denoiser((
             example_image[0][None], 
             tf.math.log(1.0 / 256)[None, None, None, None]
         ))
@@ -202,9 +200,13 @@ def log_sample(epochs, logs):
         del identity
 
         sample = example
-        log_scale = tf.math.log(1.0)[None, None, None, None]
-        for i in range(20):
-            fake, log_scale = denoiser((sample, log_scale))
+        for i in range(steps):
+            log_scale = (
+                tf.math.log(1.0) + 
+                (tf.math.log(1.0 / 256) - tf.math.log(1.0)) * i / steps
+            )
+            log_scale = log_scale[None, None, None, None]
+            fake = denoiser((sample, log_scale))
 
             epsilon = tf.random.normal(tf.shape(fake))
             scale = tf.exp(log_scale)
@@ -217,7 +219,6 @@ def log_sample(epochs, logs):
                 tf.summary.image('first_step', fake * 0.5 + 0.5, epochs, 4)
         tf.summary.image('fake', fake * 0.5 + 0.5, epochs, 4)
         tf.summary.image('sample', sample * 0.5 + 0.5, epochs, 4)
-        tf.summary.histogram('log_scale', log_scale, epochs)
 
 if __name__ == "__main__":
     name = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
