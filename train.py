@@ -3,6 +3,10 @@ import datetime, os
 import tensorflow as tf
 import tensorflow_probability as tfp
 
+dataset_pattern = "../Datasets/safebooru_r63_256/train/female/*"
+example_image_path = "../Datasets/safebooru_r63_256/train/female/"\
+"00af2f4796bcf58f445ab78e4f8a42f4931c28eec024de0e79872fa019575c5f.png"
+
 size = 256
 pixel_size = 128
 block_depth = 2
@@ -171,16 +175,12 @@ def load_file(file, crop=True):
     return image, image
 
 classes = [
-    "../Datasets/safebooru_r63_256/train/male/*",
-    "../Datasets/safebooru_r63_256/train/female/*"
+    dataset_pattern,
 ]
 
 datasets = []
 
-example_image = load_file(
-    "../Datasets/safebooru_r63_256/train/male/" +
-    "00fdb833c64d7824edaa555277e494331b3882891f9422c6bca07611a5193b5f.png"
-)
+example_image = load_file(example_image_path)
 example = tf.random.normal((4, size, size, 3))
 
 for folder in classes:
@@ -224,7 +224,7 @@ if __name__ == "__main__":
     name = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     summary_writer = tf.summary.create_file_writer(os.path.join("logs", name))
 
-    dataset_example = next(iter(datasets[1]))[0]
+    dataset_example = next(iter(datasets[0]))[0]
     loss = identity(
         dataset_example, trainer(dataset_example)
     )
@@ -236,7 +236,7 @@ if __name__ == "__main__":
     )
 
     trainer.fit(
-        datasets[1], steps_per_epoch=1000, epochs=1000,
+        datasets[0], steps_per_epoch=1000, epochs=1000,
         callbacks=[
             tf.keras.callbacks.LambdaCallback(
                 on_epoch_begin=log_sample
