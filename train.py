@@ -14,7 +14,8 @@ block_depth = 2
 batch_size = 8
 steps = 20
 
-residual = True
+residual = False
+concat = True
 
 mixed_precision = False
 
@@ -39,12 +40,14 @@ class Residual(tf.keras.layers.Layer):
 
     def build(self, input_shape):
         self.module.build(input_shape)
-        if residual:
+        if residual or concat:
             self.dense = tf.keras.layers.Dense(input_shape[-1], use_bias=False)
 
     def call(self, input):
         if residual:
             return input + self.dense(self.module(input))
+        elif concat:
+            return self.dense(tf.concat([self.module(input), input], -1))
         else:
             return self.module(input)
 
