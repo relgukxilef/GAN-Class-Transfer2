@@ -1,7 +1,6 @@
 
 import datetime, os
 import tensorflow as tf
-import tensorflow_probability as tfp
 
 dataset_pattern = "../Datasets/safebooru_r63_256/train/female/*"
 example_image_path = "../Datasets/safebooru_r63_256/train/female/"\
@@ -19,6 +18,9 @@ concat = True
 
 mixed_precision = False
 
+def log_noise_schedule(r):
+    # returns standard deviation at step t/T
+    return tf.math.log(1.0) + (tf.math.log(1.0 / 256) - tf.math.log(1.0)) * r
 
 gpu = tf.config.list_physical_devices('GPU')[0]
 tf.config.experimental.set_memory_growth(gpu, True)
@@ -152,9 +154,8 @@ class Trainer(tf.keras.Model):
         self.denoiser = denoiser
 
     def call(self, input):
-        log_scale = tf.random.uniform(
-            tf.shape(input)[:-3], 
-            tf.math.log(1.0/256), tf.math.log(1.0)
+        log_scale = log_noise_schedule(
+            tf.random.uniform(tf.shape(input)[:-3])
         )[..., None, None, None]
         scale = tf.exp(log_scale)
         epsilon = tf.random.normal(tf.shape(input))
@@ -184,7 +185,7 @@ classes = [
 datasets = []
 
 example_image = load_file(example_image_path)
-example = tf.random.normal((4, size, size, 3))
+example = tf.random.normal((steps, 4, size, size, 3))
 
 for folder in classes:
     dataset = tf.data.Dataset.list_files(folder)
@@ -202,21 +203,20 @@ def log_sample(epochs, logs):
         tf.summary.image('identity', identity * 0.5 + 0.5, epochs)
         del identity
 
-        sample = example
+        fake = example[0, ...]
+        log_scale = tf.math.log(1.0)
         for i in range(steps):
-            log_scale = (
-                tf.math.log(1.0) + 
-                (tf.math.log(1.0 / 256) - tf.math.log(1.0)) * i / steps
-            )
-            log_scale = log_scale[None, None, None, None]
-            fake = denoiser((sample, log_scale))
+            log_scale = log_noise_schedule(i / steps)
 
-            epsilon = tf.random.normal(tf.shape(fake))
+            epsilon = example[i, ...]
             scale = tf.exp(log_scale)
             sample = (
                 fake * tf.sqrt(1 - tf.square(scale)) + 
                 epsilon * scale
             )
+
+            log_scale = log_scale[None, None, None, None]
+            fake = denoiser((sample, log_scale))
 
             if i == 0:
                 tf.summary.image('step_0', fake * 0.5 + 0.5, epochs, 4)
