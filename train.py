@@ -20,7 +20,7 @@ mixed_precision = False
 
 def log_noise_schedule(r):
     # returns standard deviation at step t/T
-    return tf.math.log(1.0) + (tf.math.log(1.0 / 256) - tf.math.log(1.0)) * r
+    return tf.math.log(1.0 + (1.0 / 256 - 1.0) * r)
 
 gpu = tf.config.list_physical_devices('GPU')[0]
 tf.config.experimental.set_memory_growth(gpu, True)
