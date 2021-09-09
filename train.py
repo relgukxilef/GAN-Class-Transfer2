@@ -219,7 +219,13 @@ def log_sample(epochs, logs):
             )
 
             if i == 0:
-                tf.summary.image('first_step', fake * 0.5 + 0.5, epochs, 4)
+                tf.summary.image('step_0', fake * 0.5 + 0.5, epochs, 4)
+            if i == steps // 4:
+                tf.summary.image('step_0.25', fake * 0.5 + 0.5, epochs, 4)
+            if i == 2 * steps // 4:
+                tf.summary.image('step_0.5', fake * 0.5 + 0.5, epochs, 4)
+            if i == 3 * steps // 4:
+                tf.summary.image('step_0.75', fake * 0.5 + 0.5, epochs, 4)
         tf.summary.image('fake', fake * 0.5 + 0.5, epochs, 4)
         tf.summary.image('sample', sample * 0.5 + 0.5, epochs, 4)
 
