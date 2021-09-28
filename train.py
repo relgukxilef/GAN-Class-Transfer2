@@ -125,14 +125,14 @@ class Denoiser(tf.keras.Model):
         super().__init__()
 
         self.encoder = Encoder()
-        self.middle = Block(pixel_size)
-        for i in range(7):
+        self.middle = Block(pixel_size * 2**7)
+        for i in reversed(range(7)):
             self.middle = Residual(
                 tf.keras.Sequential([
                     DownShuffle(),
-                    Block(pixel_size),
+                    Block(pixel_size * 2**i),
                     self.middle, 
-                    Block(pixel_size),
+                    Block(pixel_size * 2**i),
                     UpShuffle(),
                 ])
             )
