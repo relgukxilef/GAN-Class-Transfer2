@@ -3,7 +3,7 @@ import datetime, os
 import tensorflow as tf
 
 dataset_pattern = "../Datasets/safebooru_r63_256/train/female/*"
-example_image_path = "../Datasets/safebooru_r63_256/train/female/"\
+example_image_path = "../Datasets/safebooru_r63_256/test/female/"\
 "00af2f4796bcf58f445ab78e4f8a42f4931c28eec024de0e79872fa019575c5f.png"
 
 size = 256
@@ -11,16 +11,16 @@ pixel_size = 128
 block_depth = 2
 
 batch_size = 8
-steps = 20
+steps = 100
 
 residual = False
 concat = True
 
 mixed_precision = False
 
-def log_noise_schedule(r):
-    # returns standard deviation at step t/T
-    return tf.math.log(1.0 + (1.0 / 256 - 1.0) * r)
+def log_image_schedule(r):
+    # returns log of square of scale of image at step t/T
+    return tf.math.log(0.1**r)
 
 gpu = tf.config.list_physical_devices('GPU')[0]
 tf.config.experimental.set_memory_growth(gpu, True)
@@ -154,19 +154,19 @@ class Trainer(tf.keras.Model):
         self.denoiser = denoiser
 
     def call(self, input):
-        log_scale = log_noise_schedule(
+        log_scale = log_image_schedule(
             tf.random.uniform(tf.shape(input)[:-3])
         )[..., None, None, None]
         scale = tf.exp(log_scale)
         epsilon = tf.random.normal(tf.shape(input))
 
         noised = (
-            input * tf.sqrt(1 - tf.square(scale)) + 
-            epsilon * scale
+            input * tf.sqrt(scale) + 
+            epsilon * tf.sqrt(1 - scale)
         )
 
-        fake = self.denoiser((noised, log_scale))
-        return tf.math.squared_difference(fake, input)
+        epsilon_theta = self.denoiser((noised, log_scale))
+        return tf.math.squared_difference(epsilon, epsilon_theta)
 
 denoiser = Denoiser()
 trainer = Trainer(denoiser)
@@ -205,29 +205,37 @@ def log_sample(epochs, logs):
 
         fake = example[0, ...]
         log_scale = tf.math.log(1.0)
-        for i in range(steps):
-            log_scale = log_noise_schedule(i / steps)
+        for t in reversed(range(1, steps + 1)):
+            log_scale = log_image_schedule(t / steps)
 
-            epsilon = example[i, ...]
-            scale = tf.exp(log_scale)
-            sample = (
-                fake * tf.sqrt(1 - tf.square(scale)) + 
-                epsilon * scale
-            )
+            alpha_t_dash = tf.exp(log_scale)
+            alpha_t = alpha_t_dash / tf.exp(log_image_schedule((t - 1) / steps))
+            
+            beta_t = 1.0 - alpha_t
+            sigma = tf.sqrt(beta_t)
+            if t == 1: 
+                sigma = 0.0
 
-            log_scale = log_scale[None, None, None, None]
-            fake = denoiser((sample, log_scale))
+            epsilon_theta = denoiser((fake, log_scale[None, None, None, None]))
 
-            if i == 0:
+            z = example[t - 1, ...]
+
+            fake = (
+                1.0 / tf.sqrt(alpha_t) * (
+                    fake - 
+                    (1 - alpha_t) / tf.sqrt(1 - alpha_t_dash) * epsilon_theta
+                )
+            ) + sigma * z
+
+            if t == 1:
                 tf.summary.image('step_0', fake * 0.5 + 0.5, epochs, 4)
-            if i == steps // 4:
+            if t == steps // 4:
                 tf.summary.image('step_0.25', fake * 0.5 + 0.5, epochs, 4)
-            if i == 2 * steps // 4:
+            if t == 2 * steps // 4:
                 tf.summary.image('step_0.5', fake * 0.5 + 0.5, epochs, 4)
-            if i == 3 * steps // 4:
+            if t == 3 * steps // 4:
                 tf.summary.image('step_0.75', fake * 0.5 + 0.5, epochs, 4)
         tf.summary.image('fake', fake * 0.5 + 0.5, epochs, 4)
-        tf.summary.image('sample', sample * 0.5 + 0.5, epochs, 4)
 
 if __name__ == "__main__":
     name = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
