@@ -83,18 +83,22 @@ class Block(tf.keras.layers.Layer):
 class UpShuffle(tf.keras.layers.Layer):
     def __init__(self):
         super().__init__()
+        self.convolution = tf.keras.layers.Conv2DTranspose(
+            pixel_size, 4, 2, 'same', activation='relu'
+        )
 
     def call(self, input):
-        return tf.keras.layers.UpSampling2D(interpolation='bilinear')(
-            input# * 0.5
-        )
+        return self.convolution(input)
 
 class DownShuffle(tf.keras.layers.Layer):
     def __init__(self):
         super().__init__()
+        self.convolution = tf.keras.layers.Conv2D(
+            pixel_size, 4, 2, 'same', activation='relu'
+        )
 
     def call(self, input):
-        return tf.keras.layers.AveragePooling2D()(input)# * 2.0
+        return self.convolution(input)
 
 class Encoder(tf.keras.layers.Layer):
     def __init__(self):
