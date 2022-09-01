@@ -15,7 +15,7 @@ max_size = 512
 block_depth = 1
 octaves = 7 # bottleneck = 2x2
 
-batch_size = 4
+batch_size = 8
 steps = 100
 
 min_noise = 0.5
@@ -43,7 +43,11 @@ if mixed_precision:
     optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
 
 def alpha_dash(t):
+    t /= steps
     return 1 - 3 * t**2 + 2 * t**3
+
+def alpha(t):
+    return alpha_dash(t) / alpha_dash(t - 1)
 
 class Residual(tf.keras.layers.Layer):
     def __init__(self, module):
@@ -166,7 +170,7 @@ class Trainer(tf.keras.Model):
 
     def call(self, input):
         t = tf.random.uniform(
-            tf.shape(input)[:-3], dtype=input.dtype
+            tf.shape(input)[:-3], maxval=steps, dtype=input.dtype
         )[..., None, None, None]
         epsilon = tf.random.normal(tf.shape(input), dtype=input.dtype)
 
@@ -235,33 +239,37 @@ def log_sample(epochs, logs):
             noised - denoiser((noised, 0)) * tf.sqrt(min_noise)
         ) / tf.sqrt(1 - min_noise)
         tf.summary.image('identity', identity * 0.5 + 0.5, epochs)
+        tf.summary.scalar(
+            'example loss', 
+            tf.reduce_mean(tf.square(example_image[0][None] - identity)), 
+            epochs
+        )
         del identity
 
         fake = example[0, ...]
 
-        for t in reversed(range(steps)):
+        for t in range(steps, 1, -1): # lowest t = 2
             epsilon_theta = tf.clip_by_value(denoiser((fake, 0)), -4, 4)
 
-            alpha_dash_t = tf.cast(alpha_dash(t / steps), preferred_type)
-            alpha_t = tf.cast(
-                alpha_dash_t / alpha_dash((t - 1) / steps), 
-                preferred_type
+            x_theta = (
+                (fake - (1 - alpha(t))**0.5 * epsilon_theta) / 
+                alpha(t)**0.5
             )
 
-            fake = 1 / tf.sqrt(alpha_t) * (
-                fake - (1 - alpha_t) / tf.sqrt(1 - alpha_dash_t) * 
-                epsilon_theta
-            )# + sigma_t * tf.random.normal(tf.shape(fake), dtype=preferred_type)
+            fake = (
+                alpha(t - 1)**0.5 * x_theta + 
+                (1 - alpha(t - 1))**0.5 * epsilon_theta
+            )
 
             if t == steps - 1:
-                tf.summary.image('step_1', fake * 0.5 + 0.5, epochs, 4)
+                tf.summary.image('step_1', x_theta * 0.5 + 0.5, epochs, 4)
             if t == steps // 4:
-                tf.summary.image('step_0.25', fake * 0.5 + 0.5, epochs, 4)
+                tf.summary.image('step_0.25', x_theta * 0.5 + 0.5, epochs, 4)
             if t == 2 * steps // 4:
-                tf.summary.image('step_0.5', fake * 0.5 + 0.5, epochs, 4)
+                tf.summary.image('step_0.5', x_theta * 0.5 + 0.5, epochs, 4)
             if t == 3 * steps // 4:
-                tf.summary.image('step_0.75', fake * 0.5 + 0.5, epochs, 4)
-        tf.summary.image('fake', fake * 0.5 + 0.5, epochs, 4)
+                tf.summary.image('step_0.75', x_theta * 0.5 + 0.5, epochs, 4)
+        tf.summary.image('fake', x_theta * 0.5 + 0.5, epochs, 4)
 
 if __name__ == "__main__":
     name = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
