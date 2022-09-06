@@ -12,7 +12,7 @@ example_image_path = "../Datasets/safebooru_r63_256/test/female/"\
 size = 256
 pixel_size = 64
 max_size = 512
-block_depth = 1
+block_depth = 2
 octaves = 7 # bottleneck = 2x2
 
 batch_size = 8
@@ -22,6 +22,8 @@ min_noise = 0.5
 
 residual = False
 concat = True
+
+predict_x = False # as opposed to epsilon
 
 mixed_precision = True
 
@@ -34,20 +36,18 @@ if mixed_precision:
     policy = tf.keras.mixed_precision.Policy('mixed_float16')
     tf.keras.mixed_precision.experimental.set_policy(policy)
 
-min_noise = tf.cast(min_noise, preferred_type)
-
 #optimizer = tf.keras.optimizers.SGD(0.01, 0.9, True)
-optimizer = tf.keras.optimizers.Adam(1e-5)
+optimizer = tf.keras.optimizers.Adam(2e-5)
 
 if mixed_precision:
     optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
 
 def alpha_dash(t):
+    from math import pi
     t /= steps
-    return 1 - 3 * t**2 + 2 * t**3
-
-def alpha(t):
-    return alpha_dash(t) / alpha_dash(t - 1)
+    #return (256*256)**(-1*t)
+    return (tf.cos(pi * t) + 1) / 2
+    return (1 - t)**4 + 1e-5
 
 class Residual(tf.keras.layers.Layer):
     def __init__(self, module):
@@ -81,11 +81,13 @@ class Block(tf.keras.layers.Layer):
     def build(self, input_shape):
         self.module = tf.keras.Sequential([
             tf.keras.Sequential([
-                tf.keras.layers.Dense(self.filters),
+                tf.keras.layers.Dense(self.filters, activation='relu'),
                 tf.keras.layers.Conv2D(
-                    self.filters, 3, 1, 'same', activation='relu', 
+                    self.filters, 3, 1, 'same', #use_bias=False,
                     dilation_rate=(self.dilation, self.dilation)
                 ),
+                #tf.keras.layers.BatchNormalization(),
+                tf.keras.layers.ReLU(),
             ]) for i in range(block_depth)
         ])
         self.module.build(input_shape)
@@ -96,39 +98,22 @@ class Block(tf.keras.layers.Layer):
 class UpShuffle(tf.keras.layers.Layer):
     def __init__(self):
         super().__init__()
+        self.convolution = tf.keras.layers.Conv2DTranspose(
+            pixel_size, 4, 2, 'same', activation='relu'
+        )
 
     def call(self, input):
-        return tf.keras.layers.UpSampling2D(interpolation='bilinear')(
-            input# * 0.5
-        )
+        return self.convolution(input)
 
 class DownShuffle(tf.keras.layers.Layer):
     def __init__(self):
         super().__init__()
+        self.convolution = tf.keras.layers.Conv2D(
+            pixel_size, 4, 2, 'same', activation='relu'
+        )
 
     def call(self, input):
-        return tf.keras.layers.AveragePooling2D()(input)# * 2.0
-
-class Encoder(tf.keras.layers.Layer):
-    def __init__(self):
-        super().__init__()
-
-        self.rgb_dense = tf.keras.layers.Dense(pixel_size, use_bias=False)
-        #self.scale_dense = tf.keras.layers.Dense(pixel_size)
-        self.output_dense = tf.keras.layers.Dense(pixel_size)
-
-    def build(self, input_shape):
-        rgb, scale = input_shape
-        self.rgb_dense.build(rgb)
-        #self.scale_dense.build(scale)
-        self.output_dense.build([pixel_size])
-
-    def call(self, input):
-        rgb, scale = input
-        return self.output_dense(tf.nn.relu(
-            self.rgb_dense(rgb)# + 
-            #self.scale_dense(scale)
-        ))
+        return self.convolution(input)
 
 @tf.function
 def identity(y_true, y_pred):
@@ -138,7 +123,7 @@ class Denoiser(tf.keras.Model):
     def __init__(self):
         super().__init__()
 
-        self.encoder = Encoder()
+        self.encoder = tf.keras.layers.Dense(pixel_size, activation='relu')
         self.middle = Block(min(pixel_size * 2**octaves, max_size))
         for i in reversed(range(octaves)):
             self.middle = Residual(
@@ -168,36 +153,32 @@ class Trainer(tf.keras.Model):
 
         self.denoiser = denoiser
 
-    def call(self, input):
+    def call(self, x):
         t = tf.random.uniform(
-            tf.shape(input)[:-3], maxval=steps, dtype=input.dtype
+            tf.shape(x)[:-3], maxval=steps, dtype=x.dtype
         )[..., None, None, None]
-        epsilon = tf.random.normal(tf.shape(input), dtype=input.dtype)
+        epsilon = tf.random.normal(tf.shape(x), dtype=x.dtype)
 
         scale = alpha_dash(t)
-        #scale = min_noise
-        
-        # exponential increase in SNR
-        #scale = tf.sqrt(2**(octaves*scale)/(2**(octaves*scale) + 2**octaves)) 
 
         noised = (
-            input * tf.sqrt(scale) + 
+            x * tf.sqrt(scale) + 
             epsilon * tf.sqrt(1 - scale)
         )
 
-        epsilon_theta = self.denoiser((noised, 0))
+        prediction = self.denoiser(noised)
 
         return tf.math.squared_difference(
-            tf.cast(epsilon, tf.float32), 
-            tf.cast(epsilon_theta, tf.float32)
+            tf.cast(x if predict_x else epsilon, tf.float32), 
+            tf.cast(prediction, tf.float32)
         )
 
 denoiser = Denoiser()
 trainer = Trainer(denoiser)
 
 @tf.function
-def decode_file(file, crop=False):
-    image = tf.image.decode_jpeg(file)[:, :, :3]
+def decode_file(file, crop=True):
+    image = tf.image.decode_jpeg(file, 3)
     if crop:
         image = tf.image.random_crop(image, [size, size, 3])
     image = tf.broadcast_to(image, [size, size, 3])
@@ -215,17 +196,16 @@ classes = [
 
 datasets = []
 
-example_image = load_file(example_image_path, True)
-example = tf.random.normal((1, 2, size, size, 3), dtype=preferred_type)
+example_image = tf.cast(load_file(example_image_path, True), tf.float32)
+example = tf.random.normal((1, 2, size, size, 3), dtype=tf.float32)
 
 for folder in classes:
     datasets += [
         tf.data.Dataset.list_files(folder)
         .map(tf.io.read_file, num_parallel_calls=tf.data.AUTOTUNE)
-        .cache("cache") # disk cache
-        .map(decode_file, num_parallel_calls=tf.data.AUTOTUNE)
-        .cache() # memory cache
+        #.cache("cache") # disk cache
         .shuffle(1000).repeat()
+        .map(decode_file, num_parallel_calls=tf.data.AUTOTUNE)
         .batch(batch_size).prefetch(tf.data.AUTOTUNE)
     ]
 
@@ -235,31 +215,48 @@ def log_sample(epochs, logs):
             example_image[0][None] * tf.sqrt(1 - min_noise) + 
             example[0, :1, ...] * tf.sqrt(min_noise)
         )
-        identity = (
-            noised - denoiser((noised, 0)) * tf.sqrt(min_noise)
-        ) / tf.sqrt(1 - min_noise)
-        tf.summary.image('identity', identity * 0.5 + 0.5, epochs)
+        prediction = tf.cast(
+            denoiser(tf.cast(noised, preferred_type)), tf.float32
+        )
+        if not predict_x:
+            denoised = (
+                noised - prediction * tf.sqrt(min_noise)
+            ) / tf.sqrt(1 - min_noise)
+        else:
+            denoised = prediction
+        tf.summary.image('identity', denoised * 0.5 + 0.5, epochs)
         tf.summary.scalar(
             'example loss', 
-            tf.reduce_mean(tf.square(example_image[0][None] - identity)), 
+            tf.reduce_mean(tf.square(example_image[0][None] - denoised)), 
             epochs
         )
-        del identity
+        del denoised
 
         fake = example[0, ...]
 
-        for t in range(steps, 1, -1): # lowest t = 2
-            epsilon_theta = tf.clip_by_value(denoiser((fake, 0)), -4, 4)
-
-            x_theta = (
-                (fake - (1 - alpha(t))**0.5 * epsilon_theta) / 
-                alpha(t)**0.5
+        for t_value in reversed(range(steps)):
+            t = t_value
+            prediction = tf.cast(
+                denoiser(tf.cast(fake, preferred_type)), tf.float32
             )
 
-            fake = (
-                alpha(t - 1)**0.5 * x_theta + 
-                (1 - alpha(t - 1))**0.5 * epsilon_theta
-            )
+            if predict_x:
+                x_theta = prediction
+                epsilon_theta = (
+                    fake - alpha_dash(t)**0.5 * x_theta
+                ) / (1 - alpha_dash(t))**0.5
+                
+            else:
+                epsilon_theta = prediction
+                x_theta = (
+                    fake - (1 - alpha_dash(t))**0.5 * epsilon_theta
+                ) / alpha_dash(t)**0.5
+
+            if t > 0:
+                fake = (
+                    alpha_dash(t - 1)**0.5 * x_theta + 
+                    (1 - alpha_dash(t - 1))**0.5 * epsilon_theta
+                )
 
             if t == steps - 1:
                 tf.summary.image('step_1', x_theta * 0.5 + 0.5, epochs, 4)
@@ -271,9 +268,12 @@ def log_sample(epochs, logs):
                 tf.summary.image('step_0.75', x_theta * 0.5 + 0.5, epochs, 4)
         tf.summary.image('fake', x_theta * 0.5 + 0.5, epochs, 4)
 
-if __name__ == "__main__":
-    name = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    summary_writer = tf.summary.create_file_writer(os.path.join("logs", name))
+if __name__ == "__main__": 
+    day = datetime.datetime.now().strftime("%Y%m%d")
+    time = datetime.datetime.now().strftime("%H%M%S")
+    summary_writer = tf.summary.create_file_writer(
+        os.path.join("logs", day, time)
+    )
 
     dataset_example = next(iter(datasets[0]))[0]
     loss = identity(
