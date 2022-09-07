@@ -24,6 +24,7 @@ residual = False
 concat = True
 
 predict_x = False # as opposed to epsilon
+ordinary_differential_equation = True
 
 mixed_precision = True
 
@@ -155,21 +156,29 @@ class Trainer(tf.keras.Model):
 
     def call(self, x):
         t = tf.random.uniform(
-            tf.shape(x)[:-3], maxval=steps, dtype=x.dtype
+            tf.shape(x)[:-3], minval=1.0, maxval=steps, dtype=x.dtype
         )[..., None, None, None]
         epsilon = tf.random.normal(tf.shape(x), dtype=x.dtype)
 
-        scale = alpha_dash(t)
-
         noised = (
-            x * tf.sqrt(scale) + 
-            epsilon * tf.sqrt(1 - scale)
+            x * alpha_dash(t)**0.5 + 
+            epsilon * (1 - alpha_dash(t))**0.5
         )
 
         prediction = self.denoiser(noised)
 
+        if ordinary_differential_equation:
+            target = (
+                x * alpha_dash(t - 1)**0.5 + 
+                epsilon * (1 - alpha_dash(t - 1))**0.5
+            )
+        elif predict_x:
+            target = x
+        else:
+            target = epsilon * (1 - alpha_dash(t))**0.5
+
         return tf.math.squared_difference(
-            tf.cast(x if predict_x else epsilon, tf.float32), 
+            tf.cast(target, tf.float32), 
             tf.cast(prediction, tf.float32)
         )
 
@@ -212,18 +221,28 @@ for folder in classes:
 def log_sample(epochs, logs):
     with summary_writer.as_default():
         noised = (
-            example_image[0][None] * tf.sqrt(1 - min_noise) + 
-            example[0, :1, ...] * tf.sqrt(min_noise)
+            example_image[0][None] * alpha_dash(steps / 2)**0.5 + 
+            example[0, :1, ...] * (1 - alpha_dash(steps / 2))**0.5
         )
         prediction = tf.cast(
             denoiser(tf.cast(noised, preferred_type)), tf.float32
         )
-        if not predict_x:
+        if ordinary_differential_equation:
             denoised = (
-                noised - prediction * tf.sqrt(min_noise)
-            ) / tf.sqrt(1 - min_noise)
-        else:
+                prediction * (1 - alpha_dash(steps / 2))**0.5 -
+                noised * (1 - alpha_dash(steps / 2 - 1))**0.5
+            ) / (
+                alpha_dash(steps / 2 - 1)**0.5 * 
+                (1 - alpha_dash(steps / 2))**0.5 -
+                alpha_dash(steps / 2)**0.5 *
+                (1 - alpha_dash(steps / 2 - 1))**0.5
+            )
+        elif predict_x:
             denoised = prediction
+        else:
+            denoised = (
+                noised - prediction
+            ) / tf.sqrt(1 - min_noise)
         tf.summary.image('identity', denoised * 0.5 + 0.5, epochs)
         tf.summary.scalar(
             'example loss', 
@@ -234,29 +253,41 @@ def log_sample(epochs, logs):
 
         fake = example[0, ...]
 
-        for t_value in reversed(range(steps)):
+        for t_value in range(steps, 0, -1): # smallest t = 1
             t = t_value
             prediction = tf.cast(
                 denoiser(tf.cast(fake, preferred_type)), tf.float32
             )
 
-            if predict_x:
-                x_theta = prediction
-                epsilon_theta = (
-                    fake - alpha_dash(t)**0.5 * x_theta
-                ) / (1 - alpha_dash(t))**0.5
-                
-            else:
-                epsilon_theta = prediction
+            if ordinary_differential_equation:
                 x_theta = (
-                    fake - (1 - alpha_dash(t))**0.5 * epsilon_theta
-                ) / alpha_dash(t)**0.5
-
-            if t > 0:
-                fake = (
-                    alpha_dash(t - 1)**0.5 * x_theta + 
-                    (1 - alpha_dash(t - 1))**0.5 * epsilon_theta
+                    prediction * (1 - alpha_dash(steps / 2))**0.5 -
+                    fake * (1 - alpha_dash(steps / 2 - 1))**0.5
+                ) / (
+                    alpha_dash(steps / 2 - 1)**0.5 * 
+                    (1 - alpha_dash(steps / 2))**0.5 -
+                    alpha_dash(steps / 2)**0.5 *
+                    (1 - alpha_dash(steps / 2 - 1))**0.5
                 )
+                fake = prediction
+            else:
+                if predict_x:
+                    x_theta = prediction
+                    epsilon_theta = (
+                        fake - alpha_dash(t)**0.5 * x_theta
+                    ) / (1 - alpha_dash(t))**0.5
+                    
+                else:
+                    epsilon_theta = prediction / (1 - alpha_dash(t))**0.5
+                    x_theta = (
+                        fake - prediction
+                    ) / alpha_dash(t)**0.5
+
+                if t > 0:
+                    fake = (
+                        alpha_dash(t - 1)**0.5 * x_theta + 
+                        (1 - alpha_dash(t - 1))**0.5 * epsilon_theta
+                    )
 
             if t == steps - 1:
                 tf.summary.image('step_1', x_theta * 0.5 + 0.5, epochs, 4)
