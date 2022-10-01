@@ -2,7 +2,7 @@
 import datetime, os
 import tensorflow as tf
 
-#dataset_pattern = "../Datasets/safebooru_r63_256/train/female/*.png"
+dataset_pattern = "../Datasets/safebooru_r63_256/train/female/*.png"
 dataset_pattern = "D:/Felix/Downloads/danbooru2020/256px/*/*"
 example_image_path = "../Datasets/safebooru_r63_256/test/female/"\
 "00af2f4796bcf58f445ab78e4f8a42f4931c28eec024de0e79872fa019575c5f.png"
@@ -23,8 +23,8 @@ min_noise = 0.5
 residual = False
 concat = True
 
-predict_x = False # as opposed to epsilon
-ordinary_differential_equation = True
+predict_x = True # as opposed to epsilon
+ordinary_differential_equation = False
 
 mixed_precision = True
 
@@ -46,8 +46,10 @@ if mixed_precision:
 def alpha_dash(t):
     from math import pi
     t /= steps
+    return 1 - 4**(t - 1)
+    #return (2**8 - 2**8**t) / (256 * 2**8**t - 2**8**t + 2**8)
     #return (256*256)**(-1*t)
-    return (tf.cos(pi * t) + 1) / 2
+    return tf.cos(pi / 2 * t)**2
     return (1 - t)**4 + 1e-5
 
 class Residual(tf.keras.layers.Layer):
@@ -167,6 +169,8 @@ class Trainer(tf.keras.Model):
 
         prediction = self.denoiser(noised)
 
+        weight = tf.cast(1.0, x.dtype)
+
         if ordinary_differential_equation:
             target = (
                 x * alpha_dash(t - 1)**0.5 + 
@@ -178,8 +182,8 @@ class Trainer(tf.keras.Model):
             target = epsilon * (1 - alpha_dash(t))**0.5
 
         return tf.math.squared_difference(
-            tf.cast(target, tf.float32), 
-            tf.cast(prediction, tf.float32)
+            tf.cast(target * weight, tf.float32), 
+            tf.cast(prediction * weight, tf.float32)
         )
 
 denoiser = Denoiser()
@@ -242,8 +246,8 @@ def log_sample(epochs, logs):
         else:
             denoised = (
                 noised - prediction
-            ) / tf.sqrt(1 - min_noise)
-        tf.summary.image('identity', denoised * 0.5 + 0.5, epochs)
+            ) / (1 - alpha_dash(steps / 2))**0.5
+        tf.summary.image('denoised', denoised * 0.5 + 0.5, epochs)
         tf.summary.scalar(
             'example loss', 
             tf.reduce_mean(tf.square(example_image[0][None] - denoised)), 
@@ -289,7 +293,7 @@ def log_sample(epochs, logs):
                         (1 - alpha_dash(t - 1))**0.5 * epsilon_theta
                     )
 
-            if t == steps - 1:
+            if t == steps:
                 tf.summary.image('step_1', x_theta * 0.5 + 0.5, epochs, 4)
             if t == steps // 4:
                 tf.summary.image('step_0.25', x_theta * 0.5 + 0.5, epochs, 4)
