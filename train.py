@@ -12,26 +12,28 @@ example_image_path = "../Datasets/safebooru_r63_256/test/female/"\
 #example_image_path = "D:/Felix/Documents/Python/PyTorch Projects/Datasets/"\
 #"saki_castle/256px/1039 saki_castle.jpg"
 
-dataset_pattern = example_image_path
+#dataset_pattern = example_image_path
 
 size = 256
 pixel_size = 128 * 1
 max_size = 512 * 1
-block_depth = 1
-octaves = 7 # bottleneck = 2x2
+block_depth = 0
+octaves = 6 # bottleneck = 4x4
 
-batch_size = 8
-steps = 50
+batch_size = 1
+steps = 200
 
 residual = False
 concat = True
 
-predict_x = False # as opposed to epsilon
+predict_x = True #False # as opposed to epsilon
 predict_scaled_epsilon = False
 prediction_weighting = False
 ordinary_differential_equation = False
 
 mixed_precision = False
+
+warm_up = 2_000
 
 preferred_type = tf.float16 if mixed_precision else tf.float32
 
@@ -45,20 +47,37 @@ if mixed_precision:
 def sign_gradient(gradient):
     return [(tf.sign(g), v) for g, v in gradient]
 
+class WarmUp(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, base, warmup_steps):
+        super().__init__()
+
+        self.base = base
+        self.warmup_steps = warmup_steps
+
+    def __call__(self, step):
+        return tf.cond(
+            step < self.warmup_steps, 
+            lambda: 
+                self.base * 
+                tf.cast(step + 1, tf.float32) / 
+                (self.warmup_steps + 1), 
+            lambda: self.base
+        )
+
 #optimizer = tf.keras.optimizers.SGD(0.25, 0.5, True)
-optimizer = tf.keras.optimizers.SGD(
-    tf.keras.optimizers.schedules.InverseTimeDecay(2.0, 10_000, 1)
-)
+#optimizer = tf.keras.optimizers.SGD(
+#    tf.keras.optimizers.schedules.InverseTimeDecay(2.0, 10_000, 1)
+#)
 #optimizer = tf.keras.optimizers.SGD(
 #    0.0001,#, 0.9, True, 
 #    gradient_transformers=[sign_gradient]
 #)
-#optimizer = tf.keras.optimizers.Adam(1e-4)
+optimizer = tf.keras.optimizers.Adam(WarmUp(2e-5, warm_up))
 #optimizer = tf.keras.optimizers.RMSprop(
 #    tf.keras.optimizers.schedules.InverseTimeDecay(1e-5, 10_000, 1)
 #)
 
-regularizer = tf.keras.regularizers.l2(1e-6)
+regularizer = None# tf.keras.regularizers.l2(1e-6)
 
 if mixed_precision:
     optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
@@ -71,7 +90,7 @@ def alpha_dash(t):
     #return (256*256)**(-1*t)
     #return tf.cos(pi / 2 * t)**2
     #return (1 - t)**4
-    return (1 - t)**2
+    return (1 - t)**2 * 0.25# + 1e-4
 
 test_step = 25
 
@@ -112,7 +131,7 @@ class Block(tf.keras.layers.Layer):
             tf.keras.Sequential([
                 tf.keras.layers.Conv2D(
                     self.filters, 3, 1, 'same', 
-                    kernel_initializer='he_uniform', activation='relu', 
+                    kernel_initializer='glorot_uniform', activation='relu', 
                     kernel_regularizer=regularizer,
                     bias_regularizer=regularizer
                 ),
@@ -127,7 +146,7 @@ class UpShuffle(tf.keras.layers.Layer):
     def __init__(self, filters):
         super().__init__()
         self.convolution = tf.keras.layers.Conv2DTranspose(
-            filters, 4, 2, 'same', kernel_initializer='he_uniform', 
+            filters, 4, 2, 'same', kernel_initializer='glorot_uniform', 
             activation='relu', 
             kernel_regularizer=regularizer,
             bias_regularizer=regularizer
@@ -140,7 +159,7 @@ class DownShuffle(tf.keras.layers.Layer):
     def __init__(self, filters):
         super().__init__()
         self.convolution = tf.keras.layers.Conv2D(
-            filters, 4, 2, 'same', kernel_initializer='he_uniform', 
+            filters, 4, 2, 'same', kernel_initializer='glorot_uniform', 
             activation='relu', 
             kernel_regularizer=regularizer,
             bias_regularizer=regularizer
@@ -163,25 +182,25 @@ class Denoiser(tf.keras.Model):
             self.middle = Residual(
                 tf.keras.Sequential([
                     DownShuffle(filters),
-                    #Block(filters),
+                    Block(filters),
                     self.middle, 
-                    #Block(filters),
+                    Block(filters),
                     UpShuffle(min(pixel_size * 2**i // 2, max_size)),
                 ])
             )
         self.middle = tf.keras.Sequential([
-            #Block(pixel_size),
+            Block(pixel_size),
             self.middle,
-            #Block(pixel_size),
+            Block(pixel_size),
             #tf.keras.layers.Dense(
-            #    pixel_size, kernel_initializer='he_uniform', activation='relu'
+            #    pixel_size, kernel_initializer='glorot_uniform', activation='relu'
             #),
             tf.keras.layers.Dense(
-                3 * steps, #kernel_initializer='zeros', 
+                3,# * steps, #kernel_initializer='zeros', 
                 kernel_regularizer=regularizer,
                 bias_regularizer=regularizer
             ),
-            tf.keras.layers.Reshape((size, size, steps, 3)),
+            #tf.keras.layers.Reshape((size, size, steps, 3)),
         ])
 
     def call(self, input):
@@ -189,11 +208,11 @@ class Denoiser(tf.keras.Model):
         t = t[..., 0]
         t = tf.broadcast_to(t, tf.shape(x)[:-1])
         prediction = self.middle(x)
-        x_theta = tf.gather(
-            # [batch, width, height, steps, channels]
-            prediction, t - 1, batch_dims=3
-        )
-        return x_theta
+        #prediction = tf.gather(
+        #    # [batch, width, height, steps, channels]
+        #    prediction, t - 1, batch_dims=3
+        #)
+        return prediction
 
 class Trainer(tf.keras.Model):
     def __init__(self, denoiser):
